@@ -27,6 +27,17 @@ const PERMISSIONS = [
   'withdrawals.read', 'withdrawals.review', 'trading.read', 'trading.control', 'markets.read',
   'markets.control', 'options.read', 'options.control', 'ledger.read', 'ledger.adjust', 'audit.read',
   'platform.read', 'platform.control', 'admins.read', 'admins.manage', 'admin_contacts.read', 'admin_contacts.control',
+  // Support (Role Separation) — support.tickets.reply/internal_note already
+  // existed and were previously ungrantable through this page (only
+  // reachable via a raw API call); listed here now so a Super Admin can
+  // actually delegate day-to-day Support work through the UI. Message
+  // EDITING is deliberately NOT here — it is a role (SUPER_ADMIN only), not
+  // a grantable permission; see AdminSupportController.editMessage().
+  'support.tickets.read', 'support.tickets.assign', 'support.tickets.update', 'support.tickets.reply',
+  'support.tickets.internal_note', 'support.tickets.resolve', 'support.tickets.close', 'support.categories.manage',
+  // Cross-ticket moderation feed — SUPER_ADMIN has it for free; ungranted by
+  // default for a plain ADMIN, same as every permission above.
+  'support.audit',
 ] as const
 
 export function AdminManagementPage() {

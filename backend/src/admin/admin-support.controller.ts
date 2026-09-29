@@ -1,7 +1,7 @@
-import { Body, Controller, Get, Param, Patch, Post, Query, UploadedFile, UseGuards, UseInterceptors } from '@nestjs/common'
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query, UploadedFile, UseGuards, UseInterceptors } from '@nestjs/common'
 import { FileInterceptor } from '@nestjs/platform-express'
 import { SupportService } from '../support/support.service'
-import { CreateMessageDto, CreateStaffTicketDto, EditMessageDto, UpdateStatusDto, UpdatePriorityDto, AssignTicketDto, AttachmentBodyDto } from '../support/dto/ticket.dto'
+import { CreateMessageDto, CreateStaffTicketDto, EditMessageDto, DeleteMessageDto, UpdateStatusDto, UpdatePriorityDto, AssignTicketDto, AttachmentBodyDto } from '../support/dto/ticket.dto'
 import { CreateCategoryDto, UpdateCategoryDto } from '../support/dto/category.dto'
 import { SessionAuthGuard } from '../common/guards/session-auth.guard'
 import { RolesGuard } from '../common/guards/roles.guard'
@@ -74,15 +74,48 @@ export class AdminSupportController {
     return this.support.addStaffMessage(admin.id, id, dto)
   }
 
-  // Editing a message you previously sent. No route-level
-  // @RequirePermissions() for the same reason as addMessage above — the real
-  // check (support.tickets.reply vs support.tickets.internal_note) depends on
-  // the stored message's visibility, and the author-only rule needs the
-  // stored authorId; both are enforced in SupportService.editStaffMessage().
-  // There is deliberately no customer-facing counterpart on SupportController.
+  // Editing a message you previously sent — SUPER_ADMIN ONLY. @Roles here
+  // overrides the class-level @Roles('ADMIN', 'SUPER_ADMIN') entirely (Nest's
+  // getAllAndOverride takes the handler's own metadata, not a union with the
+  // class's), so a plain ADMIN is rejected by RolesGuard before this handler
+  // ever runs — not merely a hidden button. No @RequirePermissions(): this is
+  // deliberately not a grantable permission, it is a role. The author-only
+  // rule (you may only edit your own message) is enforced in
+  // SupportService.editStaffMessage(), which independently re-checks the
+  // SUPER_ADMIN role too (defense in depth). There is deliberately no
+  // customer-facing counterpart on SupportController.
   @Patch('tickets/:ticketId/messages/:messageId')
+  @Roles('SUPER_ADMIN')
   editMessage(@Param('ticketId') ticketId: string, @Param('messageId') messageId: string, @Body() dto: EditMessageDto, @CurrentUser() admin: AuthenticatedUser) {
     return this.support.editStaffMessage(admin.id, ticketId, messageId, dto)
+  }
+
+  // Deleting (soft) a message — SUPER_ADMIN ONLY, same @Roles override
+  // pattern as editMessage() immediately above, so a plain ADMIN is rejected
+  // by RolesGuard before this handler ever runs, direct API call included.
+  // No @RequirePermissions(): deletion is a role, not a grantable
+  // permission — holding support.audit (which only gates VIEWING the
+  // moderation feed) does not grant this. There is deliberately no
+  // customer-facing counterpart, and no "restore" endpoint (this is scoped
+  // exactly to the requested capability — a real undo would need its own
+  // separate, explicit design).
+  @Delete('tickets/:ticketId/messages/:messageId')
+  @Roles('SUPER_ADMIN')
+  deleteMessage(@Param('ticketId') ticketId: string, @Param('messageId') messageId: string, @Body() dto: DeleteMessageDto, @CurrentUser() admin: AuthenticatedUser) {
+    return this.support.deleteStaffMessage(admin.id, ticketId, messageId, dto)
+  }
+
+  // Support Audit — a cross-ticket moderation feed (every ticket's full
+  // message history, PUBLIC and INTERNAL, plus the message-edit trail).
+  // Gated by the support.audit permission: SUPER_ADMIN always has it
+  // (PermissionsGuard's role bypass); a plain ADMIN only has it once a
+  // SUPER_ADMIN explicitly grants it via the existing
+  // PATCH /admin/admins/:id/permissions/support.audit/grant endpoint — no
+  // new grant mechanism, reuses the one every other permission uses.
+  @Get('audit')
+  @RequirePermissions('support.audit')
+  getAuditFeed(@Query('limit') limit?: string) {
+    return this.support.listSupportAuditFeed(limit ? Number(limit) : undefined)
   }
 
   // Same deliberate absence of a route-level @RequirePermissions() as

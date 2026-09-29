@@ -324,6 +324,20 @@ export class AdminService {
   async updateUserRole(targetUserId: string, dto: UpdateUserRoleDto, adminId: string) {
     await this.stepUp.assertStepUpAuthorized(adminId, dto.confirmPassword)
     const target = await this.prisma.user.findUniqueOrThrow({ where: { id: targetUserId } })
+
+    // Refuse to demote the LAST SUPER_ADMIN, whether that's a self-demotion or
+    // one SUPER_ADMIN demoting another — the platform must never be left with
+    // zero accounts able to manage roles/permissions. Not a self-lockout
+    // check specifically (an account is never special-cased by its own id);
+    // it only fires when this WOULD be the last one, so a platform with
+    // several SUPER_ADMINs is unaffected.
+    if (target.role === 'SUPER_ADMIN' && dto.role !== 'SUPER_ADMIN') {
+      const otherSuperAdmins = await this.prisma.user.count({ where: { role: 'SUPER_ADMIN', id: { not: targetUserId } } })
+      if (otherSuperAdmins === 0) {
+        throw new BadRequestException('Cannot change the role of the last Super Admin — promote another account to Super Admin first.')
+      }
+    }
+
     const updated = await this.prisma.user.update({ where: { id: targetUserId }, data: { role: dto.role } })
 
     await this.recordAdminAction(adminId, AuditEvent.ROLE_CHANGED, targetUserId, dto.reason, { role: target.role }, { role: dto.role })

@@ -24,9 +24,15 @@ vi.mock('../../lib/api', async () => {
   }
 })
 
-// The signed-in staff member — the only author whose messages are editable.
+// The signed-in staff member. Mutable (reset to a plain ADMIN in the outer
+// beforeEach below) so the "editing a message you sent" describe block can
+// switch it to SUPER_ADMIN — message editing is now a role restriction, not
+// a permission, so those tests need the viewer to actually hold that role.
+let currentUser: { id: string; role: 'ADMIN' | 'SUPER_ADMIN' } = { id: 'admin1', role: 'ADMIN' }
+const getCurrentUser = () => currentUser
+
 vi.mock('../../store/auth', () => ({
-  useAuth: () => ({ user: { id: 'admin1', role: 'ADMIN' } }),
+  useAuth: () => ({ user: getCurrentUser() }),
 }))
 
 const TICKET: SupportTicket = {
@@ -68,6 +74,7 @@ const FOUND_USER = { id: 'u-new', email: 'newcustomer@example.com', fullName: 'N
 
 describe('Admin SupportPage', () => {
   beforeEach(() => {
+    currentUser = { id: 'admin1', role: 'ADMIN' }
     apiGet.mockReset()
     apiPost.mockReset()
     apiPatch.mockReset()
@@ -160,7 +167,8 @@ describe('Admin SupportPage', () => {
     fireEvent(el, ev)
   }
 
-  describe('editing a message you sent', () => {
+  describe('editing a message you sent (as SUPER_ADMIN — see "message editing is SUPER_ADMIN only" below for the plain-ADMIN case)', () => {
+    beforeEach(() => { currentUser = { id: 'admin1', role: 'SUPER_ADMIN' } })
     afterEach(() => { vi.useRealTimers() })
 
     it('shows no edit affordance until the gesture — there is no permanent Edit button on any message', async () => {
@@ -417,6 +425,39 @@ describe('Admin SupportPage', () => {
 
       await waitFor(() => expect(screen.getAllByText('Fresh preview wording.')).toHaveLength(2)) // preview + bubble
       expect(screen.queryByText('Your withdrawal is being processed.')).not.toBeInTheDocument()
+    })
+  })
+
+  // Message editing is SUPER_ADMIN only (Role Separation) — currentUser here
+  // is the outer beforeEach's default, a plain ADMIN, deliberately NOT
+  // overridden. m3 ("Your withdrawal is being processed.") is authored by
+  // this exact user id (admin1), so this is the strongest case: even for a
+  // message this ADMIN genuinely sent itself, neither gesture is offered.
+  // The backend enforcement itself (rejecting a direct API call regardless
+  // of what the UI shows) is covered in backend/test/support.e2e-spec.ts's
+  // "30f2".
+  describe('message editing is SUPER_ADMIN only — a plain ADMIN gets neither gesture, even on its own message', () => {
+    afterEach(() => { vi.useRealTimers() })
+
+    it('desktop: right-clicking a message this ADMIN itself sent opens no menu', async () => {
+      await openThread()
+      fireEvent.contextMenu(bubbleOf('Your withdrawal is being processed.'))
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+      expect(screen.queryByText('Edit message')).not.toBeInTheDocument()
+    })
+
+    it('touch: press-and-hold on that same message for the full duration opens no menu', async () => {
+      await openThread()
+      const bubble = bubbleOf('Your withdrawal is being processed.')
+      vi.useFakeTimers()
+      touch(bubble, 'touchStart')
+      act(() => { vi.advanceTimersByTime(LONG_PRESS_MS + 500) })
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+    })
+
+    it('the bubble carries no data-editable marker for a plain ADMIN\'s own message', async () => {
+      await openThread()
+      expect(bubbleOf('Your withdrawal is being processed.')).not.toHaveAttribute('data-editable')
     })
   })
 

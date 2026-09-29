@@ -145,6 +145,83 @@ describe('Authorization: roles + fine-grained permissions (real PostgreSQL)', ()
       .expect(403)
   })
 
+  // Role-separation hardening — the last SUPER_ADMIN can never be demoted,
+  // whether that's a self-demotion or one SUPER_ADMIN demoting another. The
+  // platform must never be left with zero accounts able to manage roles and
+  // permissions. See AdminService.updateUserRole().
+  it('the last SUPER_ADMIN cannot be demoted (by itself or by another actor), but demoting succeeds once a second SUPER_ADMIN exists', async () => {
+    // The guard counts SUPER_ADMIN rows GLOBALLY (correct for a real,
+    // single-tenant production database) — this shared, never-truncated e2e
+    // database already has many SUPER_ADMIN fixtures left behind by other
+    // tests/files, so "the last one" has to be engineered here: snapshot and
+    // temporarily demote every OTHER existing SUPER_ADMIN (direct Prisma
+    // write, bypassing the very guard under test), then restore them
+    // afterward no matter how the test finishes.
+    const others = await prisma.user.findMany({ where: { role: 'SUPER_ADMIN' }, select: { id: true } })
+    await prisma.user.updateMany({ where: { id: { in: others.map((o) => o.id) } }, data: { role: 'ADMIN' } })
+
+    try {
+      const email = uniqueEmail('lastsuper')
+      const password = 'correct-horse-battery'
+      const { user } = await createUserDirect(prisma, { email, password, role: 'SUPER_ADMIN' })
+      const cookie = await loginCookie(server, email, password)
+
+      // A distinct SUPER_ADMIN account performs the (rejected) demotion —
+      // this is not merely a self-lockout check, it fires for ANY actor if
+      // the TARGET would become the last one gone.
+      const otherEmail = uniqueEmail('wouldbelast')
+      const otherPassword = 'correct-horse-battery'
+      const { user: otherUser } = await createUserDirect(prisma, { email: otherEmail, password: otherPassword, role: 'SUPER_ADMIN' })
+      const otherCookie = await loginCookie(server, otherEmail, otherPassword)
+
+      // Demote `user` from the OTHER account while `user` is still not the
+      // last one (otherUser exists) — this must succeed...
+      await request(server).patch(`/admin/users/${user.id}/role`).set('Cookie', otherCookie)
+        .send({ role: 'ADMIN', reason: 'demote while not last', confirmPassword: otherPassword }).expect(200)
+      expect((await prisma.user.findUniqueOrThrow({ where: { id: user.id } })).role).toBe('ADMIN')
+
+      // ...now `otherUser` IS the only SUPER_ADMIN left. Demoting it — even by
+      // itself — must be refused.
+      const res = await request(server).patch(`/admin/users/${otherUser.id}/role`).set('Cookie', otherCookie)
+        .send({ role: 'ADMIN', reason: 'self-demote as the last one', confirmPassword: otherPassword })
+      expect(res.status).toBe(400)
+      expect((await prisma.user.findUniqueOrThrow({ where: { id: otherUser.id } })).role).toBe('SUPER_ADMIN')
+
+      // Promoting `user` back to SUPER_ADMIN, then demoting `otherUser`, works —
+      // there are two again at the moment of the call.
+      await request(server).patch(`/admin/users/${user.id}/role`).set('Cookie', otherCookie)
+        .send({ role: 'SUPER_ADMIN', reason: 're-promote', confirmPassword: otherPassword }).expect(200)
+      await request(server).patch(`/admin/users/${otherUser.id}/role`).set('Cookie', cookie)
+        .send({ role: 'ADMIN', reason: 'demote now that a second one exists', confirmPassword: password }).expect(200)
+      expect((await prisma.user.findUniqueOrThrow({ where: { id: otherUser.id } })).role).toBe('ADMIN')
+    } finally {
+      await prisma.user.updateMany({ where: { id: { in: others.map((o) => o.id) } }, data: { role: 'SUPER_ADMIN' } })
+    }
+  })
+
+  // Support Audit — same "SUPER_ADMIN by default, grantable to an ADMIN"
+  // shape as every other permission (see support.e2e-spec.ts's "31"/"32"/"33"
+  // for the full moderation-feed behavior); this just confirms it follows
+  // the exact same grant mechanism proven above for platform.read.
+  it('Support Audit follows the same grant model: SUPER_ADMIN has it for free, a plain ADMIN needs an explicit support.audit grant', async () => {
+    const superEmail = uniqueEmail('auditsuper')
+    const superPassword = 'correct-horse-battery'
+    const { user: superUser } = await createUserDirect(prisma, { email: superEmail, password: superPassword, role: 'SUPER_ADMIN' })
+    const superSecret = await enableTotpDirect(prisma, superUser.id)
+    const superCookie = await loginCookie(server, superEmail, superPassword, superSecret)
+    await request(server).get('/admin/support/audit').set('Cookie', superCookie).expect(200)
+
+    const adminEmail = uniqueEmail('auditscopedadmin')
+    const adminPassword = 'correct-horse-battery'
+    const { user: adminUser } = await createUserDirect(prisma, { email: adminEmail, password: adminPassword, role: 'ADMIN' })
+    const adminCookie = await loginCookie(server, adminEmail, adminPassword)
+    await request(server).get('/admin/support/audit').set('Cookie', adminCookie).expect(403)
+
+    await request(server).patch(`/admin/admins/${adminUser.id}/permissions/support.audit/grant`).set('Cookie', superCookie)
+      .send({ reason: 'test grant', confirmPassword: superPassword }).expect(200)
+    await request(server).get('/admin/support/audit').set('Cookie', adminCookie).expect(200)
+  })
+
   it('SUPER_ADMIN passes every permission check without any explicit grant', async () => {
     const email = uniqueEmail('superoverview')
     const password = 'correct-horse-battery'

@@ -147,6 +147,11 @@ export const AuditEvent = {
   // before/after, so the original is never lost even though the visible
   // SupportMessage.body is replaced. See SupportService.editStaffMessage().
   SUPPORT_MESSAGE_EDITED: 'SUPPORT_MESSAGE_EDITED',
+  // Soft-deleting one Support message (SUPER_ADMIN only; Support Audit).
+  // previousState carries the full original body/visibility (the message
+  // row itself is never hard-deleted, but this is the record that survives
+  // even if it ever were) — see SupportService.deleteStaffMessage().
+  MESSAGE_DELETED: 'MESSAGE_DELETED',
   SUPPORT_CATEGORY_CHANGED: 'SUPPORT_CATEGORY_CHANGED',
   SUPPORT_AUTO_GREETING_CHANGED: 'SUPPORT_AUTO_GREETING_CHANGED',
   SUPPORT_NOTIFICATION_EMAIL_CHANGED: 'SUPPORT_NOTIFICATION_EMAIL_CHANGED',

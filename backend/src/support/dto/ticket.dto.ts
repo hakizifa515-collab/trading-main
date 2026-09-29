@@ -68,6 +68,16 @@ export class EditMessageDto {
   body!: string
 }
 
+// Support Audit — soft-deleting one message (SUPER_ADMIN only; see
+// SupportService.deleteStaffMessage). A written reason is required, same
+// bound as every other reason field in this file — this one also becomes
+// part of the MESSAGE_DELETED audit record.
+export class DeleteMessageDto {
+  @IsString()
+  @MinLength(3)
+  reason!: string
+}
+
 export class UpdateStatusDto {
   @IsIn(['OPEN', 'IN_PROGRESS', 'WAITING_FOR_CUSTOMER', 'WAITING_INTERNAL', 'RESOLVED', 'CLOSED'])
   status!: string

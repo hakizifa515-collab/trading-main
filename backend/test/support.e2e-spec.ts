@@ -582,22 +582,25 @@ describe('Customer Support (real PostgreSQL)', () => {
     expect(res.body.categoryId).toBeTruthy()
   })
 
-  // ---- 30: staff message editing ----------------------------------------
+  // ---- 30: staff message editing (SUPER_ADMIN ONLY) ----------------------
   // The visible thread must stay clean (no edited flag/timestamp/history in
   // any normal conversation payload); the original text must survive
-  // internally, in the append-only AuditLog.
+  // internally, in the append-only AuditLog. Editing is a ROLE, not a
+  // permission — a plain ADMIN cannot do it no matter what support.* grants
+  // it holds (see 30f2/30g below); only SUPER_ADMIN can, and only for a
+  // message it authored itself.
 
-  async function ticketWithAgentMessage(agentPerms: string[] = ['support.tickets.read', 'support.tickets.reply'], body = 'Your withdrawal is being processed.') {
+  async function ticketWithAgentMessage(body = 'Your withdrawal is being processed.') {
     const customer = await makeCustomer('edit-cust')
     const ticket = await request(server).post('/support/tickets').set('Cookie', customer.cookie).send({ categoryId, subject: 'Q', message: 'Where is my money?' }).expect(201)
-    const agent = await makeAgentWith(...agentPerms)
+    const agent = await makeSuperAdmin('edit-super')
     const sent = await request(server).post(`/admin/support/tickets/${ticket.body.id}/messages`).set('Cookie', agent.cookie).send({ body }).expect(201)
     return { customer, agent, ticketId: ticket.body.id as string, messageId: sent.body.id as string, originalBody: body }
   }
 
   const editUrl = (ticketId: string, messageId: string) => `/admin/support/tickets/${ticketId}/messages/${messageId}`
 
-  it('30. an agent can edit a message they sent: the customer and admin views both show only the updated text, with no duplicate, no reorder, no edited marker', async () => {
+  it('30. a Super Admin can edit a message they sent: the customer and admin views both show only the updated text, with no duplicate, no reorder, no edited marker', async () => {
     const { customer, agent, ticketId, messageId, originalBody } = await ticketWithAgentMessage()
     // A later customer message so ordering is observable.
     await request(server).post(`/support/tickets/${ticketId}/messages`).set('Cookie', customer.cookie).send({ body: 'Thanks, any ETA?' }).expect(201)
@@ -648,7 +651,7 @@ describe('Customer Support (real PostgreSQL)', () => {
   })
 
   it('30c. no normal customer or admin conversation payload exposes the original text or any edit-history field', async () => {
-    const { customer, agent, ticketId, messageId, originalBody } = await ticketWithAgentMessage(undefined, 'ORIGINAL-SECRET-WORDING-123')
+    const { customer, agent, ticketId, messageId, originalBody } = await ticketWithAgentMessage('ORIGINAL-SECRET-WORDING-123')
     await request(server).patch(editUrl(ticketId, messageId)).set('Cookie', agent.cookie).send({ body: 'Corrected wording.' }).expect(200)
 
     const customerView = await request(server).get(`/support/tickets/${ticketId}`).set('Cookie', customer.cookie).expect(200)
@@ -666,7 +669,7 @@ describe('Customer Support (real PostgreSQL)', () => {
   it('30d. editing keeps the message\'s attachments intact', async () => {
     const customer = await makeCustomer('edit-attach')
     const ticket = await request(server).post('/support/tickets').set('Cookie', customer.cookie).send({ categoryId, subject: 'Q', message: 'hi' }).expect(201)
-    const agent = await makeAgentWith('support.tickets.read', 'support.tickets.reply')
+    const agent = await makeSuperAdmin('edit-attach-super')
     const upload = await request(server).post(`/admin/support/tickets/${ticket.body.id}/attachments`).set('Cookie', agent.cookie)
       .field('body', 'Here is the receipt').attach('file', PNG_BYTES, { filename: 'receipt.png', contentType: 'image/png' }).expect(201)
     const attachmentId = upload.body.attachments[0].id
@@ -695,27 +698,58 @@ describe('Customer Support (real PostgreSQL)', () => {
     expect(agent.userId).toBe(stored.authorId)
   })
 
-  it('30f. a different admin — even one with support.tickets.reply — cannot edit another author\'s message, and neither can anyone edit a customer\'s message', async () => {
+  it('30f. a different Super Admin cannot edit another Super Admin\'s message, and neither can anyone edit a customer\'s message', async () => {
     const { customer, ticketId, messageId, originalBody } = await ticketWithAgentMessage()
-    const otherAgent = await makeAgentWith('support.tickets.read', 'support.tickets.reply', 'support.tickets.internal_note')
-    await request(server).patch(editUrl(ticketId, messageId)).set('Cookie', otherAgent.cookie).send({ body: 'not yours' }).expect(403)
+    const otherSuper = await makeSuperAdmin('edit-other-super')
+    await request(server).patch(editUrl(ticketId, messageId)).set('Cookie', otherSuper.cookie).send({ body: 'not yours' }).expect(403)
 
     const customerMsg = await prisma.supportMessage.findFirstOrThrow({ where: { ticketId, authorId: customer.userId } })
-    await request(server).patch(editUrl(ticketId, customerMsg.id)).set('Cookie', otherAgent.cookie).send({ body: 'rewriting the customer' }).expect(403)
+    await request(server).patch(editUrl(ticketId, customerMsg.id)).set('Cookie', otherSuper.cookie).send({ body: 'rewriting the customer' }).expect(403)
 
     expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: messageId } })).body).toBe(originalBody)
     expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: customerMsg.id } })).body).toBe('Where is my money?')
     expect(await prisma.auditLog.count({ where: { action: 'SUPPORT_MESSAGE_EDITED', targetId: { in: [messageId, customerMsg.id] } } })).toBe(0)
   })
 
-  it('30g. the author loses the ability to edit if the required permission is revoked, and an admin with no support permission can\'t edit at all', async () => {
-    const { agent, ticketId, messageId, originalBody } = await ticketWithAgentMessage()
-    await prisma.userPermission.deleteMany({ where: { userId: agent.userId } })
-    await request(server).patch(editUrl(ticketId, messageId)).set('Cookie', agent.cookie).send({ body: 'after revoke' }).expect(403)
+  it('30f2. a plain ADMIN can NEVER edit a support message via the API — not another author\'s, and not even one it sent itself — no matter which support.* permissions it holds; only the role matters', async () => {
+    // The ADMIN authors its own message (with full support permissions, the
+    // same way any ordinary staff reply is created) and then tries to edit
+    // that exact message it just sent.
+    const customer = await makeCustomer('edit-plainadmin')
+    const ticket = await request(server).post('/support/tickets').set('Cookie', customer.cookie).send({ categoryId, subject: 'Q', message: 'hi' }).expect(201)
+    const fullAgent = await makeAgentWith('support.tickets.read', 'support.tickets.reply', 'support.tickets.internal_note', 'support.tickets.update', 'support.tickets.assign', 'support.tickets.resolve', 'support.tickets.close', 'support.audit')
+    const own = await request(server).post(`/admin/support/tickets/${ticket.body.id}/messages`).set('Cookie', fullAgent.cookie).send({ body: 'my own reply' }).expect(201)
+    await request(server).patch(editUrl(ticket.body.id, own.body.id)).set('Cookie', fullAgent.cookie).send({ body: 'trying to edit my own message' }).expect(403)
+    expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: own.body.id } })).body).toBe('my own reply')
 
-    const noPerm = await makeAgentWith()
-    await request(server).patch(editUrl(ticketId, messageId)).set('Cookie', noPerm.cookie).send({ body: 'no perm' }).expect(403)
+    // And, as before, a Super Admin's own message is equally untouchable by this ADMIN.
+    const { ticketId, messageId, originalBody } = await ticketWithAgentMessage()
+    await request(server).patch(editUrl(ticketId, messageId)).set('Cookie', fullAgent.cookie).send({ body: 'still not yours' }).expect(403)
     expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: messageId } })).body).toBe(originalBody)
+    expect(await prisma.auditLog.count({ where: { action: 'SUPPORT_MESSAGE_EDITED', targetId: { in: [own.body.id, messageId] } } })).toBe(0)
+  })
+
+  it('30g. demoting the author from SUPER_ADMIN to ADMIN immediately removes their ability to edit their own past message; promoting back restores it', async () => {
+    const { agent, ticketId, messageId, originalBody } = await ticketWithAgentMessage()
+    // A second Super Admin exists so demoting `agent` is legal (never the last one).
+    const rootSuper = await makeSuperAdmin('edit-root-super')
+
+    await request(server).patch(`/admin/users/${agent.userId}/role`).set('Cookie', rootSuper.cookie)
+      .send({ role: 'ADMIN', reason: 'demote for e2e', confirmPassword: 'correct-horse-battery' }).expect(200)
+    await request(server).patch(editUrl(ticketId, messageId)).set('Cookie', agent.cookie).send({ body: 'after demotion' }).expect(403)
+    expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: messageId } })).body).toBe(originalBody)
+
+    await request(server).patch(`/admin/users/${agent.userId}/role`).set('Cookie', rootSuper.cookie)
+      .send({ role: 'SUPER_ADMIN', reason: 're-promote for e2e', confirmPassword: 'correct-horse-battery' }).expect(200)
+    await request(server).patch(editUrl(ticketId, messageId)).set('Cookie', agent.cookie).send({ body: 'after re-promotion' }).expect(200)
+    expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: messageId } })).body).toBe('after re-promotion')
+  })
+
+  it('30g2. an unauthenticated caller and a plain USER both get rejected before any role/author check even runs', async () => {
+    const { ticketId, messageId } = await ticketWithAgentMessage()
+    await request(server).patch(editUrl(ticketId, messageId)).send({ body: 'anon' }).expect(401)
+    const { cookie } = await makeCustomer('edit-plainuser-noticket')
+    await request(server).patch(editUrl(ticketId, messageId)).set('Cookie', cookie).send({ body: 'nope' }).expect(403)
   })
 
   it('30h. invalid edits are rejected: empty body, tags-only body, over-long body, wrong ticket, unknown message', async () => {
@@ -742,10 +776,10 @@ describe('Customer Support (real PostgreSQL)', () => {
     expect(originalBody).not.toBe('A corrected reply.')
   })
 
-  it('30j. an INTERNAL note can be edited by its own author (with the internal_note permission) and stays invisible to the customer', async () => {
+  it('30j. a Super Admin can edit an INTERNAL note it authored (Super Admin bypasses the internal_note permission entirely) and it stays invisible to the customer', async () => {
     const customer = await makeCustomer('edit-internal')
     const ticket = await request(server).post('/support/tickets').set('Cookie', customer.cookie).send({ categoryId, subject: 'Q', message: 'hi' }).expect(201)
-    const agent = await makeAgentWith('support.tickets.read', 'support.tickets.internal_note')
+    const agent = await makeSuperAdmin('edit-internal-super')
     const note = await request(server).post(`/admin/support/tickets/${ticket.body.id}/messages`).set('Cookie', agent.cookie).send({ body: 'Escalate to finance', visibility: 'INTERNAL' }).expect(201)
 
     await request(server).patch(editUrl(ticket.body.id, note.body.id)).set('Cookie', agent.cookie).send({ body: 'Escalate to compliance' }).expect(200)
@@ -755,10 +789,268 @@ describe('Customer Support (real PostgreSQL)', () => {
 
     const customerView = await request(server).get(`/support/tickets/${ticket.body.id}`).set('Cookie', customer.cookie).expect(200)
     expect(JSON.stringify(customerView.body)).not.toMatch(/Escalate to (finance|compliance)/)
+  })
 
-    // An agent holding only .reply (not .internal_note) can't edit an internal note.
-    await prisma.userPermission.deleteMany({ where: { userId: agent.userId } })
-    await grantPermissionDirect(prisma, agent.userId, 'support.tickets.reply')
+  it('30k. a plain ADMIN holding support.tickets.internal_note can still create an internal note as before (unaffected) — it just can never edit it', async () => {
+    const customer = await makeCustomer('edit-internal-admin')
+    const ticket = await request(server).post('/support/tickets').set('Cookie', customer.cookie).send({ categoryId, subject: 'Q', message: 'hi' }).expect(201)
+    const agent = await makeAgentWith('support.tickets.read', 'support.tickets.internal_note')
+    const note = await request(server).post(`/admin/support/tickets/${ticket.body.id}/messages`).set('Cookie', agent.cookie).send({ body: 'Escalate to finance', visibility: 'INTERNAL' }).expect(201)
+    expect(note.body.visibility).toBe('INTERNAL') // ticket creation/reply behavior is unchanged by this task
+
     await request(server).patch(editUrl(ticket.body.id, note.body.id)).set('Cookie', agent.cookie).send({ body: 'sneaky' }).expect(403)
+    expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: note.body.id } })).body).toBe('Escalate to finance')
+  })
+
+  // ---- Support Audit (SUPER_ADMIN by default; grantable to an ADMIN) -----
+
+  it('31. GET /admin/support/audit is available to SUPER_ADMIN with no explicit grant, and rejected for a plain ADMIN until support.audit is granted', async () => {
+    const superAdmin = await makeSuperAdmin('audit-super')
+    await request(server).get('/admin/support/audit').set('Cookie', superAdmin.cookie).expect(200)
+
+    const plainAdmin = await makeAgentWith('support.tickets.read', 'support.tickets.reply') // every OTHER support permission, deliberately not support.audit
+    await request(server).get('/admin/support/audit').set('Cookie', plainAdmin.cookie).expect(403)
+
+    await grantPermissionDirect(prisma, plainAdmin.userId, 'support.audit')
+    await request(server).get('/admin/support/audit').set('Cookie', plainAdmin.cookie).expect(200)
+  })
+
+  it('32. the audit feed shows PUBLIC and INTERNAL messages across every ticket (not just one agent\'s own), plus the message-edit trail', async () => {
+    const customerA = await makeCustomer('audit-cust-a')
+    const ticketA = await request(server).post('/support/tickets').set('Cookie', customerA.cookie).send({ categoryId, subject: 'A', message: 'AUDIT-FEED-PUBLIC-MARKER' }).expect(201)
+    const superAdmin = await makeSuperAdmin('audit-super2')
+    await request(server).post(`/admin/support/tickets/${ticketA.body.id}/messages`).set('Cookie', superAdmin.cookie).send({ body: 'AUDIT-FEED-INTERNAL-MARKER', visibility: 'INTERNAL' }).expect(201)
+    const editedMsg = await request(server).post(`/admin/support/tickets/${ticketA.body.id}/messages`).set('Cookie', superAdmin.cookie).send({ body: 'to be edited' }).expect(201)
+    await request(server).patch(editUrl(ticketA.body.id, editedMsg.body.id)).set('Cookie', superAdmin.cookie).send({ body: 'AUDIT-FEED-EDITED-MARKER' }).expect(200)
+
+    const feed = await request(server).get('/admin/support/audit').set('Cookie', superAdmin.cookie).expect(200)
+    const bodies = feed.body.messages.map((m: any) => m.body)
+    expect(bodies).toContain('AUDIT-FEED-PUBLIC-MARKER')
+    expect(bodies).toContain('AUDIT-FEED-INTERNAL-MARKER') // INTERNAL included — this is a moderation view, not the customer-facing one
+    expect(bodies).toContain('AUDIT-FEED-EDITED-MARKER')
+    const publicMsg = feed.body.messages.find((m: any) => m.body === 'AUDIT-FEED-PUBLIC-MARKER')
+    expect(publicMsg.ticket.id).toBe(ticketA.body.id)
+    expect(publicMsg.ticket.user.id).toBe(customerA.userId)
+
+    const editEvent = feed.body.editHistory.find((e: any) => e.newState?.body === 'AUDIT-FEED-EDITED-MARKER')
+    expect(editEvent).toBeTruthy()
+    expect(editEvent.actor.id).toBe(superAdmin.userId)
+    expect(editEvent.previousState.body).toBe('to be edited')
+  })
+
+  it('33. a customer and an unauthenticated caller are both rejected from the Support Audit feed', async () => {
+    const { cookie } = await makeCustomer('audit-plainuser')
+    await request(server).get('/admin/support/audit').set('Cookie', cookie).expect(403)
+    await request(server).get('/admin/support/audit').expect(401)
+  })
+
+  // ---- 34+: Support Audit message deletion (SUPER_ADMIN only) -----------
+  // Soft delete: SupportMessage.deletedAt/deletedByAdminId. The row, its
+  // body, and its attachments are never removed from the database — only
+  // hidden from the ordinary customer/admin read paths.
+
+  const deleteUrl = (ticketId: string, messageId: string) => `/admin/support/tickets/${ticketId}/messages/${messageId}`
+  const del = (cookie: string, ticketId: string, messageId: string, reason = 'moderation removal') =>
+    request(server).delete(deleteUrl(ticketId, messageId)).set('Cookie', cookie).send({ reason })
+
+  it('34. a Super Admin can delete a CLIENT message: it vanishes from the customer\'s own chat, the ticket survives, and the rest of the conversation keeps its order', async () => {
+    const customer = await makeCustomer('del-client')
+    const ticket = await request(server).post('/support/tickets').set('Cookie', customer.cookie).send({ categoryId, subject: 'Q', message: 'DELETE-ME-CLIENT-MESSAGE' }).expect(201)
+    const superAdmin = await makeSuperAdmin('del-client-super')
+    await request(server).post(`/admin/support/tickets/${ticket.body.id}/messages`).set('Cookie', superAdmin.cookie).send({ body: 'keep-me-reply' }).expect(201)
+    const clientMsgId = (await prisma.supportMessage.findFirstOrThrow({ where: { ticketId: ticket.body.id, body: 'DELETE-ME-CLIENT-MESSAGE' } })).id
+    const orderBefore = (await prisma.supportMessage.findMany({ where: { ticketId: ticket.body.id }, orderBy: { createdAt: 'asc' } })).map((m) => m.id)
+
+    const res = await del(superAdmin.cookie, ticket.body.id, clientMsgId).expect(200)
+    expect(res.body).toMatchObject({ ok: true, messageId: clientMsgId })
+
+    const customerView = await request(server).get(`/support/tickets/${ticket.body.id}`).set('Cookie', customer.cookie).expect(200)
+    expect(customerView.body.messages.some((m: any) => m.id === clientMsgId)).toBe(false)
+    expect(customerView.body.messages.some((m: any) => m.body === 'keep-me-reply')).toBe(true) // the rest survives
+
+    const ticketRow = await prisma.supportTicket.findUniqueOrThrow({ where: { id: ticket.body.id } })
+    expect(ticketRow).toBeTruthy() // the ticket itself was never touched
+    const remaining = await prisma.supportMessage.findMany({ where: { ticketId: ticket.body.id }, orderBy: { createdAt: 'asc' } })
+    expect(remaining.map((m) => m.id)).toEqual(orderBefore) // same rows, same order — soft delete, no reordering, no deletion of siblings
+    const deletedRow = remaining.find((m) => m.id === clientMsgId)!
+    expect(deletedRow.body).toBe('DELETE-ME-CLIENT-MESSAGE') // body preserved, only flagged
+    expect(deletedRow.deletedAt).not.toBeNull()
+    expect(deletedRow.deletedByAdminId).toBe(superAdmin.userId)
+  })
+
+  it('35. a Super Admin can delete a SUPPORT-AGENT message the same way, and it disappears from the normal admin ticket view too', async () => {
+    const { customer, agent, ticketId, messageId } = await ticketWithAgentMessage('DELETE-ME-AGENT-MESSAGE')
+    await del(agent.cookie, ticketId, messageId).expect(200)
+
+    const customerView = await request(server).get(`/support/tickets/${ticketId}`).set('Cookie', customer.cookie).expect(200)
+    expect(JSON.stringify(customerView.body)).not.toContain('DELETE-ME-AGENT-MESSAGE')
+
+    const adminView = await request(server).get(`/admin/support/tickets/${ticketId}`).set('Cookie', agent.cookie).expect(200)
+    expect(adminView.body.messages.some((m: any) => m.id === messageId)).toBe(false) // hidden from the normal staff view too, not just the customer's
+
+    const adminList = await request(server).get('/admin/support/tickets').set('Cookie', agent.cookie).expect(200)
+    expect(JSON.stringify(adminList.body)).not.toContain('DELETE-ME-AGENT-MESSAGE') // never resurfaces as the ticket-list preview either
+
+    const stored = await prisma.supportMessage.findUniqueOrThrow({ where: { id: messageId } })
+    expect(stored.body).toBe('DELETE-ME-AGENT-MESSAGE') // still in the database — soft delete
+  })
+
+  it('36. a plain ADMIN gets 403 attempting to delete a message directly via the API — even holding support.audit and every other support permission', async () => {
+    const { ticketId, messageId, originalBody } = await ticketWithAgentMessage()
+    const fullAgent = await makeAgentWith('support.tickets.read', 'support.tickets.reply', 'support.tickets.internal_note', 'support.tickets.update', 'support.audit')
+    await del(fullAgent.cookie, ticketId, messageId).expect(403)
+    expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: messageId } })).body).toBe(originalBody)
+    expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: messageId } })).deletedAt).toBeNull()
+    expect(await prisma.auditLog.count({ where: { action: 'MESSAGE_DELETED', targetId: messageId } })).toBe(0)
+  })
+
+  it('37. a customer gets 403 (and an unauthenticated caller 401) attempting to delete a message — there is no customer-facing delete route at all', async () => {
+    const { customer, ticketId, messageId, originalBody } = await ticketWithAgentMessage()
+    await del(customer.cookie, ticketId, messageId).expect(403)
+    await request(server).delete(deleteUrl(ticketId, messageId)).send({ reason: 'anon' }).expect(401)
+    expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: messageId } })).body).toBe(originalBody)
+  })
+
+  it('38. deleting a message never deletes the ticket/conversation, and never changes its status', async () => {
+    const { ticketId, messageId } = await ticketWithAgentMessage()
+    const superAdmin = await makeSuperAdmin('del-ticket-status-super')
+    const before = await prisma.supportTicket.findUniqueOrThrow({ where: { id: ticketId } })
+    await del(superAdmin.cookie, ticketId, messageId).expect(200)
+    const after = await prisma.supportTicket.findUniqueOrThrow({ where: { id: ticketId } })
+    expect(after.id).toBe(before.id)
+    expect(after.status).toBe(before.status)
+    expect(after.assignedAgentId).toBe(before.assignedAgentId)
+  })
+
+  it('39. deleting one message in the middle of a conversation leaves every other message exactly intact, in the same order', async () => {
+    const customer = await makeCustomer('del-middle')
+    const ticket = await request(server).post('/support/tickets').set('Cookie', customer.cookie).send({ categoryId, subject: 'Q', message: 'first' }).expect(201)
+    const superAdmin = await makeSuperAdmin('del-middle-super')
+    const mid = await request(server).post(`/admin/support/tickets/${ticket.body.id}/messages`).set('Cookie', superAdmin.cookie).send({ body: 'middle-to-delete' }).expect(201)
+    await request(server).post(`/support/tickets/${ticket.body.id}/messages`).set('Cookie', customer.cookie).send({ body: 'last' }).expect(201)
+
+    await del(superAdmin.cookie, ticket.body.id, mid.body.id).expect(200)
+
+    const view = await request(server).get(`/admin/support/tickets/${ticket.body.id}`).set('Cookie', superAdmin.cookie).expect(200)
+    const bodies = view.body.messages.map((m: any) => m.body)
+    expect(bodies).toEqual(['first', 'last']) // the deleted one is gone, the other two keep their original relative order
+  })
+
+  it('40. a MESSAGE_DELETED audit record is written with every required field: message id, ticket id, sender id/type, actor, timestamp, and the original body', async () => {
+    const { ticketId, messageId, originalBody } = await ticketWithAgentMessage()
+    const superAdmin = await makeSuperAdmin('del-audit-super')
+    await del(superAdmin.cookie, ticketId, messageId, 'contained a phone number').expect(200)
+
+    const rows = await prisma.auditLog.findMany({ where: { action: 'MESSAGE_DELETED', targetId: messageId } })
+    expect(rows).toHaveLength(1)
+    const row = rows[0]
+    expect(row.actorId).toBe(superAdmin.userId) // administrator who performed the deletion
+    expect(row.targetType).toBe('SUPPORT_MESSAGE')
+    expect(row.targetId).toBe(messageId) // message ID
+    expect(row.reason).toBe('contained a phone number')
+    expect((row.metadata as any).ticketId).toBe(ticketId) // ticket/conversation ID
+    expect((row.metadata as any).senderType).toBe('STAFF') // sender type — the message came from the agent fixture
+    expect((row.previousState as any).body).toBe(originalBody) // original content preserved
+    expect(row.createdAt).toBeInstanceOf(Date) // timestamp
+  })
+
+  it('40b. sender type is correctly reported as CUSTOMER when the deleted message was the client\'s own', async () => {
+    const customer = await makeCustomer('del-sendertype')
+    const ticket = await request(server).post('/support/tickets').set('Cookie', customer.cookie).send({ categoryId, subject: 'Q', message: 'hi' }).expect(201)
+    const superAdmin = await makeSuperAdmin('del-sendertype-super')
+    const clientMsg = await prisma.supportMessage.findFirstOrThrow({ where: { ticketId: ticket.body.id } })
+    await del(superAdmin.cookie, ticket.body.id, clientMsg.id).expect(200)
+    const row = await prisma.auditLog.findFirstOrThrow({ where: { action: 'MESSAGE_DELETED', targetId: clientMsg.id } })
+    expect((row.metadata as any).senderId).toBe(customer.userId)
+    expect((row.metadata as any).senderType).toBe('CUSTOMER')
+  })
+
+  it('41. a deleted message never appears in the customer chat, the normal admin ticket view, or the admin ticket-list preview — deleting the ticket\'s only/latest message', async () => {
+    const customer = await makeCustomer('del-onlymsg')
+    const ticket = await request(server).post('/support/tickets').set('Cookie', customer.cookie).send({ categoryId, subject: 'Q', message: 'ONLY-MESSAGE-MARKER' }).expect(201)
+    const superAdmin = await makeSuperAdmin('del-onlymsg-super')
+    const onlyMsg = await prisma.supportMessage.findFirstOrThrow({ where: { ticketId: ticket.body.id } })
+    await del(superAdmin.cookie, ticket.body.id, onlyMsg.id).expect(200)
+
+    const customerView = await request(server).get(`/support/tickets/${ticket.body.id}`).set('Cookie', customer.cookie).expect(200)
+    expect(customerView.body.messages).toHaveLength(0)
+    const adminList = await request(server).get('/admin/support/tickets').set('Cookie', superAdmin.cookie).expect(200)
+    const row = adminList.body.find((t: any) => t.id === ticket.body.id)
+    expect(row.messages).toHaveLength(0) // no stale preview once the only message is deleted
+  })
+
+  it('42. attachments are handled safely: deleting a message with an attachment keeps the file row and bytes intact in storage, but both the customer and staff can no longer fetch it — while an unrelated message\'s attachment is completely unaffected', async () => {
+    const customer = await makeCustomer('del-attach')
+    const ticket = await request(server).post('/support/tickets').set('Cookie', customer.cookie).send({ categoryId, subject: 'Q', message: 'hi' }).expect(201)
+    const superAdmin = await makeSuperAdmin('del-attach-super')
+    const toDelete = await request(server).post(`/admin/support/tickets/${ticket.body.id}/attachments`).set('Cookie', superAdmin.cookie)
+      .field('body', 'delete-this-file').attach('file', PNG_BYTES, { filename: 'secret.png', contentType: 'image/png' }).expect(201)
+    const toKeep = await request(server).post(`/admin/support/tickets/${ticket.body.id}/attachments`).set('Cookie', superAdmin.cookie)
+      .field('body', 'keep-this-file').attach('file', PNG_BYTES, { filename: 'keep.png', contentType: 'image/png' }).expect(201)
+    const deletedAttachmentId = toDelete.body.attachments[0].id
+    const keptAttachmentId = toKeep.body.attachments[0].id
+
+    await del(superAdmin.cookie, ticket.body.id, toDelete.body.id).expect(200)
+
+    // The attachment ROW still exists in the database — never hard-deleted.
+    const attachmentRow = await prisma.supportAttachment.findUniqueOrThrow({ where: { id: deletedAttachmentId } })
+    expect(attachmentRow.filename).toBe('secret.png')
+
+    // But nobody can fetch its bytes through the normal route any more.
+    await request(server).get(`/support/attachments/${deletedAttachmentId}`).set('Cookie', customer.cookie).expect(404)
+    await request(server).get(`/support/attachments/${deletedAttachmentId}`).set('Cookie', superAdmin.cookie).expect(404)
+
+    // The OTHER attachment (on a different, non-deleted message) is completely unaffected.
+    await request(server).get(`/support/attachments/${keptAttachmentId}`).set('Cookie', customer.cookie).expect(200)
+    const keptRow = await prisma.supportAttachment.findUniqueOrThrow({ where: { id: keptAttachmentId } })
+    expect(keptRow.filename).toBe('keep.png')
+  })
+
+  it('43. direct-API bypass attempts are all rejected: wrong ticket id, unknown message id, an already-deleted message, and a missing/short reason', async () => {
+    const { ticketId, messageId } = await ticketWithAgentMessage()
+    const other = await ticketWithAgentMessage()
+    const superAdmin = await makeSuperAdmin('del-bypass-super')
+
+    await del(superAdmin.cookie, other.ticketId, messageId).expect(404) // message doesn't belong to this ticket
+    await request(server).delete(deleteUrl(ticketId, '00000000-0000-4000-8000-000000000000')).set('Cookie', superAdmin.cookie).send({ reason: 'ghost' }).expect(404)
+    await request(server).delete(deleteUrl(ticketId, messageId)).set('Cookie', superAdmin.cookie).send({}).expect(400) // reason is required
+    await request(server).delete(deleteUrl(ticketId, messageId)).set('Cookie', superAdmin.cookie).send({ reason: 'ab' }).expect(400) // too short
+
+    await del(superAdmin.cookie, ticketId, messageId).expect(200) // the real, valid delete
+    await del(superAdmin.cookie, ticketId, messageId).expect(404) // deleting an already-deleted message is refused, not a silent success
+    expect(await prisma.auditLog.count({ where: { action: 'MESSAGE_DELETED', targetId: messageId } })).toBe(1) // no double audit row from the repeat attempt
+  })
+
+  it('44. a deletion sends no customer notification and does not touch the message-edit feature — an un-deleted message can still be edited normally', async () => {
+    const { customer, agent, ticketId, messageId } = await ticketWithAgentMessage()
+    const other = await ticketWithAgentMessage()
+    const notesBefore = await prisma.supportNotification.count({ where: { userId: customer.userId } })
+
+    await del(agent.cookie, ticketId, messageId).expect(200)
+    expect(await prisma.supportNotification.count({ where: { userId: customer.userId } })).toBe(notesBefore) // no notification fired
+
+    // Editing the DELETED message is now correctly refused (it no longer "exists" for normal purposes)...
+    await request(server).patch(editUrl(ticketId, messageId)).set('Cookie', agent.cookie).send({ body: 'edit a deleted message' }).expect(404)
+    // ...but editing still works completely normally for an untouched message elsewhere.
+    await request(server).patch(editUrl(other.ticketId, other.messageId)).set('Cookie', other.agent.cookie).send({ body: 'still editable' }).expect(200)
+  })
+
+  it('45. the Support Audit feed shows a deleted message (flagged) plus its own MESSAGE_DELETED entry in deleteHistory, separate from edit history', async () => {
+    const { ticketId, messageId, originalBody } = await ticketWithAgentMessage()
+    const superAdmin = await makeSuperAdmin('del-feed-super')
+    await del(superAdmin.cookie, ticketId, messageId, 'feed visibility check').expect(200)
+
+    const feed = await request(server).get('/admin/support/audit').set('Cookie', superAdmin.cookie).expect(200)
+    const feedMsg = feed.body.messages.find((m: any) => m.id === messageId)
+    expect(feedMsg).toBeTruthy() // still visible in the AUDIT feed, unlike every normal view
+    expect(feedMsg.body).toBe(originalBody)
+    expect(feedMsg.deletedAt).not.toBeNull()
+    expect(feedMsg.deletedByAdminId).toBe(superAdmin.userId)
+
+    const deleteEvent = feed.body.deleteHistory.find((e: any) => e.targetId === messageId)
+    expect(deleteEvent).toBeTruthy()
+    expect(deleteEvent.actor.id).toBe(superAdmin.userId)
+    expect(deleteEvent.reason).toBe('feed visibility check')
+    expect(feed.body.editHistory.some((e: any) => e.targetId === messageId)).toBe(false) // deletion is not recorded as an edit
   })
 })

@@ -39,6 +39,7 @@ import { ContactsPage as AdminContactsPage } from './pages/admin/ContactsPage'
 import { KycPage as AdminKycPage } from './pages/admin/KycPage'
 import { SettingsPage as AdminSettingsPage } from './pages/admin/SettingsPage'
 import { AdminManagementPage } from './pages/admin/AdminManagementPage'
+import { SupportAuditPage } from './pages/admin/SupportAuditPage'
 import { AccountPage as AdminAccountPage } from './pages/admin/AccountPage'
 import { CmsPage as AdminCmsPage } from './pages/admin/CmsPage'
 import { AuditPage as AdminAuditPage } from './pages/admin/AuditPage'
@@ -115,6 +116,7 @@ export default function App() {
         <Route path="kyc" element={<AdminKycPage />} />
         <Route path="settings" element={<AdminSettingsPage />} />
         <Route path="admin-management" element={<AdminManagementPage />} />
+        <Route path="support-audit" element={<SupportAuditPage />} />
         <Route path="account" element={<AdminAccountPage />} />
         {/* Not primary dashboard cards, but real working sections — reachable
             from Settings ("More") rather than removed. */}

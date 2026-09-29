@@ -68,6 +68,15 @@ export const PERMISSIONS = [
   'support.tickets.resolve',
   'support.tickets.close',
   'support.categories.manage',
+  // Cross-ticket moderation feed (every ticket's full message history,
+  // PUBLIC and INTERNAL, plus the message-edit trail) — deliberately a
+  // SEPARATE permission from support.tickets.read, which only ever exposes
+  // one ticket at a time to staff already working it. Like every permission
+  // here, a plain ADMIN has this only if a SUPER_ADMIN explicitly grants it;
+  // SUPER_ADMIN always has it via PermissionsGuard's role bypass. Message
+  // EDITING itself is not permission-gated at all — see
+  // AdminSupportController.editMessage()'s @Roles('SUPER_ADMIN').
+  'support.audit',
 ] as const
 
 export type PermissionKey = (typeof PERMISSIONS)[number]

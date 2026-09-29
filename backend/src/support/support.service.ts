@@ -7,7 +7,7 @@ import { sanitizeText } from '../cms/cms.validation'
 import { MediaStorageService } from '../cms/media-storage.service'
 import { PlatformSettingsService } from '../platform-settings/platform-settings.service'
 import { EmailService } from '../email/email.service'
-import type { CreateTicketDto, CreateMessageDto, CreateStaffTicketDto, EditMessageDto } from './dto/ticket.dto'
+import type { CreateTicketDto, CreateMessageDto, CreateStaffTicketDto, EditMessageDto, DeleteMessageDto } from './dto/ticket.dto'
 import type { CreateCategoryDto, UpdateCategoryDto } from './dto/category.dto'
 
 type UploadedFileLike = { originalname: string; mimetype: string; buffer: Buffer }
@@ -147,14 +147,15 @@ export class SupportService {
     return this.prisma.supportTicket.findMany({ where: { userId }, orderBy: { updatedAt: 'desc' }, include: { category: true } })
   }
 
-  // Returns the ticket with only PUBLIC messages — INTERNAL notes are
-  // filtered out at the query level (not just hidden by the frontend), so
-  // there is no response payload for a customer request that ever contains
-  // internal-note content in the first place.
+  // Returns the ticket with only PUBLIC, non-deleted messages — INTERNAL
+  // notes and soft-deleted messages (Support Audit) are both filtered out at
+  // the query level (not just hidden by the frontend), so there is no
+  // response payload for a customer request that ever contains internal-note
+  // or deleted content in the first place.
   async getTicketForCustomer(userId: string, ticketId: string) {
     const ticket = await this.prisma.supportTicket.findUnique({
       where: { id: ticketId },
-      include: { category: true, messages: { where: { visibility: 'PUBLIC' }, orderBy: { createdAt: 'asc' }, include: { attachments: true } } },
+      include: { category: true, messages: { where: { visibility: 'PUBLIC', deletedAt: null }, orderBy: { createdAt: 'asc' }, include: { attachments: true } } },
     })
     if (!ticket) throw new NotFoundException('Ticket not found.')
     if (ticket.userId !== userId) throw new ForbiddenException('You do not have access to this ticket.')
@@ -271,14 +272,63 @@ export class SupportService {
         user: { select: { id: true, email: true, fullName: true } },
         assignedAgent: { select: { id: true, email: true, fullName: true } },
         // Last-message preview for the ticket list (Customer Support
-        // redesign) — PUBLIC only, so a staff member with support.tickets.read
-        // but not the separate support.tickets.internal_note permission never
-        // sees internal-note content leak into a list preview.
-        messages: { where: { visibility: 'PUBLIC' }, orderBy: { createdAt: 'desc' }, take: 1 },
+        // redesign) — PUBLIC and non-deleted only, so a staff member with
+        // support.tickets.read but not the separate
+        // support.tickets.internal_note permission never sees internal-note
+        // content leak into a list preview, and a deleted message (Support
+        // Audit) never resurfaces here either.
+        messages: { where: { visibility: 'PUBLIC', deletedAt: null }, orderBy: { createdAt: 'desc' }, take: 1 },
       },
     })
   }
 
+  // ---- Support Audit (cross-ticket moderation feed) --------------------
+  // Gated by the support.audit permission at the controller — SUPER_ADMIN
+  // has it via PermissionsGuard's role bypass, same as every permission; a
+  // plain ADMIN only has it if a SUPER_ADMIN explicitly grants it. Unlike
+  // every other read in this service, this deliberately crosses ticket
+  // boundaries (every ticket, every message, PUBLIC and INTERNAL) — it is a
+  // moderation/investigation view, not a working agent's own queue.
+  //
+  // Deliberately does NOT filter out soft-deleted messages (the only place
+  // in this whole service that doesn't) — an investigator needs to see that
+  // a message existed and was removed, which is exactly why deletion is a
+  // soft flag rather than a hard delete. Each message's own deletedAt/
+  // deletedByAdminId fields (returned as plain scalars, no extra work
+  // needed) tell the frontend which rows are deleted; deleteHistory below is
+  // the authoritative MESSAGE_DELETED audit trail for who/why/when.
+  async listSupportAuditFeed(limit = 100) {
+    const take = Math.min(Math.max(limit, 1), 300)
+    const [messages, editHistory, deleteHistory] = await Promise.all([
+      this.prisma.supportMessage.findMany({
+        orderBy: { createdAt: 'desc' },
+        take,
+        include: {
+          author: { select: { id: true, email: true, fullName: true, role: true } },
+          attachments: true,
+          ticket: { select: { id: true, subject: true, status: true, userId: true, user: { select: { id: true, email: true, fullName: true } } } },
+        },
+      }),
+      this.prisma.auditLog.findMany({
+        where: { action: AuditEvent.SUPPORT_MESSAGE_EDITED },
+        orderBy: { createdAt: 'desc' },
+        take,
+        include: { actor: { select: { id: true, email: true, fullName: true } } },
+      }),
+      this.prisma.auditLog.findMany({
+        where: { action: AuditEvent.MESSAGE_DELETED },
+        orderBy: { createdAt: 'desc' },
+        take,
+        include: { actor: { select: { id: true, email: true, fullName: true } } },
+      }),
+    ])
+    return { messages, editHistory, deleteHistory }
+  }
+
+  // Deliberately excludes soft-deleted messages (Support Audit) — same
+  // "clean normal view" treatment as PUBLIC-only filtering for a customer;
+  // a deleted message is reviewable ONLY through listSupportAuditFeed()
+  // above, never through the ordinary staff ticket view.
   async getTicketForStaff(ticketId: string) {
     const ticket = await this.prisma.supportTicket.findUnique({
       where: { id: ticketId },
@@ -286,7 +336,7 @@ export class SupportService {
         category: true,
         user: { select: { id: true, email: true, fullName: true, kycStatus: true } },
         assignedAgent: { select: { id: true, email: true, fullName: true } },
-        messages: { orderBy: { createdAt: 'asc' }, include: { author: { select: { id: true, email: true, fullName: true, role: true } }, attachments: true } },
+        messages: { where: { deletedAt: null }, orderBy: { createdAt: 'asc' }, include: { author: { select: { id: true, email: true, fullName: true, role: true } }, attachments: true } },
       },
     })
     if (!ticket) throw new NotFoundException('Ticket not found.')
@@ -338,16 +388,20 @@ export class SupportService {
   // No customer notification and no admin email: an edit is a correction to
   // an existing message, not new activity on the ticket.
   //
-  // Authorization is enforced here, not just by the frontend: the required
-  // permission depends on the message's visibility (same split as
-  // addStaffMessage), and on top of it the caller must be the message's own
-  // author — the permission model has no "edit someone else's message"
-  // capability, so no role (SUPER_ADMIN included) can edit another author's.
+  // SUPER_ADMIN ONLY. This is checked again here, not just by
+  // AdminSupportController.editMessage()'s @Roles('SUPER_ADMIN') — the same
+  // defense-in-depth posture as every other fund/accountability-critical
+  // check in this codebase (e.g. isDemoResultModeAllowed() in the options
+  // settlement path). No support.* permission grants this to a plain ADMIN;
+  // it is not a permission at all, it is a role. On top of that the caller
+  // must still be the message's own author — a SUPER_ADMIN cannot edit
+  // another admin's or a customer's message either.
   async editStaffMessage(adminId: string, ticketId: string, messageId: string, dto: EditMessageDto) {
-    const message = await this.prisma.supportMessage.findUnique({ where: { id: messageId } })
-    if (!message || message.ticketId !== ticketId) throw new NotFoundException('Message not found.')
+    const admin = await this.prisma.user.findUniqueOrThrow({ where: { id: adminId } })
+    if (admin.role !== 'SUPER_ADMIN') throw new ForbiddenException('Only a Super Admin can edit a support message.')
 
-    await this.assertPermission(adminId, message.visibility === 'INTERNAL' ? 'support.tickets.internal_note' : 'support.tickets.reply')
+    const message = await this.prisma.supportMessage.findUnique({ where: { id: messageId } })
+    if (!message || message.ticketId !== ticketId || message.deletedAt) throw new NotFoundException('Message not found.')
     if (message.authorId !== adminId) throw new ForbiddenException('You can only edit messages you sent.')
 
     const newBody = sanitizeText(dto.body)
@@ -371,6 +425,51 @@ export class SupportService {
       }, tx)
       return updated
     })
+  }
+
+  // Support Audit — soft-deleting ONE message. SUPER_ADMIN ONLY, checked
+  // again here on top of AdminSupportController.deleteMessage()'s own
+  // @Roles('SUPER_ADMIN') (same defense-in-depth posture as
+  // editStaffMessage() immediately above) — deletion is not a permission
+  // grantable to a plain ADMIN, no matter which support.* permissions
+  // (support.audit included) it holds; it is a role. Unlike editing, there is
+  // no author-only rule: a Super Admin may delete ANY message — a client's
+  // or an agent's — which is exactly the moderation capability Support Audit
+  // exists for.
+  //
+  // This ONLY sets deletedAt/deletedByAdminId on the SupportMessage row —
+  // the row itself, its body, and its attachments are never touched or
+  // removed, and neither the parent SupportTicket nor any sibling message is
+  // touched. The original body is preserved a second time, independently, in
+  // the MESSAGE_DELETED AuditLog's previousState — so it survives even in a
+  // hypothetical future where the message row's own body were ever scrubbed.
+  // No customer notification, no admin email, no ticket-status change: a
+  // deletion is a moderation action, not new ticket activity.
+  async deleteStaffMessage(adminId: string, ticketId: string, messageId: string, dto: DeleteMessageDto) {
+    const admin = await this.prisma.user.findUniqueOrThrow({ where: { id: adminId } })
+    if (admin.role !== 'SUPER_ADMIN') throw new ForbiddenException('Only a Super Admin can delete a support message.')
+
+    const message = await this.prisma.supportMessage.findUnique({ where: { id: messageId }, include: { ticket: { select: { userId: true } } } })
+    if (!message || message.ticketId !== ticketId || message.deletedAt) throw new NotFoundException('Message not found.')
+
+    const senderType = message.authorId === message.ticket.userId ? 'CUSTOMER' : 'STAFF'
+    const now = new Date()
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.supportMessage.update({ where: { id: messageId }, data: { deletedAt: now, deletedByAdminId: adminId } })
+      await this.audit.record({
+        actorId: adminId,
+        action: AuditEvent.MESSAGE_DELETED,
+        targetType: 'SUPPORT_MESSAGE',
+        targetId: messageId,
+        reason: dto.reason,
+        previousState: { body: message.body, visibility: message.visibility },
+        newState: { deleted: true },
+        metadata: { ticketId, senderId: message.authorId, senderType },
+      }, tx)
+    })
+
+    return { ok: true, messageId, deletedAt: now }
   }
 
   async updateStatus(adminId: string, ticketId: string, status: string, reason?: string) {
@@ -608,7 +707,13 @@ export class SupportService {
       where: { id: attachmentId },
       include: { message: { include: { ticket: true } } },
     })
-    if (!attachment) throw new NotFoundException('Attachment not found.')
+    // Support Audit — once the parent message is soft-deleted, its
+    // attachment(s) are no longer served through this route for ANYONE
+    // (customer or staff alike), matching "no deleted content in a normal
+    // response" for attachments too. A Super Admin investigating in Support
+    // Audit still sees the attachment's own metadata (filename, size) in
+    // listSupportAuditFeed() — only the byte stream is unreachable here.
+    if (!attachment || attachment.message.deletedAt) throw new NotFoundException('Attachment not found.')
     const ticket = attachment.message.ticket
     if (ticket.userId !== requesterId) {
       await this.assertPermission(requesterId, 'support.tickets.read')

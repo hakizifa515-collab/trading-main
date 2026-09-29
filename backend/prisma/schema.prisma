@@ -1100,6 +1100,16 @@ model SupportMessage {
   visibility SupportMessageVisibility @default(PUBLIC)
   createdAt  DateTime                 @default(now())
   editedAt   DateTime?
+  // Soft delete (Support Audit) — mirrors editedAt's own nullable-timestamp
+  // shape. Deliberately NOT a hard delete: the row, its body, and its
+  // attachments are all left completely intact so the Support Audit feed can
+  // still show what was deleted, by whom, and when (paired with the
+  // MESSAGE_DELETED AuditLog entry, which additionally preserves the
+  // original body in previousState even if this row's body were ever
+  // scrubbed later). Every ordinary customer/admin read path filters
+  // deletedAt: null; only SupportService.listSupportAuditFeed() does not.
+  deletedAt        DateTime?
+  deletedByAdminId String?
 
   ticket      SupportTicket       @relation(fields: [ticketId], references: [id])
   author      User                @relation("SupportMessageAuthor", fields: [authorId], references: [id], onDelete: Restrict)
@@ -1107,6 +1117,7 @@ model SupportMessage {
 
   @@index([ticketId])
   @@index([visibility])
+  @@index([deletedAt])
 }
 
 // A file attached to a support message (Phase 4, Part 15). Reuses the exact
