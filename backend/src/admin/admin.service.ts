@@ -1,5 +1,5 @@
-import { BadRequestException, Injectable } from '@nestjs/common'
-import type { Prisma } from '@prisma/client'
+import { BadRequestException, ForbiddenException, Injectable } from '@nestjs/common'
+import type { Prisma, Role } from '@prisma/client'
 import { Decimal } from '@prisma/client/runtime/library'
 import * as argon2 from 'argon2'
 import { generateReferralCode } from '../auth/referral-code.util'
@@ -234,9 +234,18 @@ export class AdminService {
   async listUsers(q?: string) {
     const search = q?.trim()
     const users = await this.prisma.user.findMany({
-      where: search
-        ? { OR: [{ email: { contains: search, mode: 'insensitive' } }, { fullName: { contains: search, mode: 'insensitive' } }, { id: search }] }
-        : undefined,
+      where: {
+        // Never surface a SUPER_ADMIN account on this general list — it's
+        // reachable by any ADMIN holding users.read, and this view was never
+        // meant to reveal that the platform-owner account exists (that's
+        // what the dedicated, SUPER_ADMIN-only Admin Management list —
+        // listAdmins() below — is for). A plain ADMIN row is unaffected and
+        // still shows normally.
+        role: { not: 'SUPER_ADMIN' },
+        ...(search
+          ? { OR: [{ email: { contains: search, mode: 'insensitive' as const } }, { fullName: { contains: search, mode: 'insensitive' as const } }, { id: search }] }
+          : {}),
+      },
       orderBy: { createdAt: 'desc' },
       take: 200,
     })
@@ -277,7 +286,7 @@ export class AdminService {
     }
   }
 
-  async updateUserStatus(targetUserId: string, dto: UpdateUserStatusDto, adminId: string) {
+  async updateUserStatus(targetUserId: string, dto: UpdateUserStatusDto, adminId: string, actorRole: Role) {
     // Admin Panel redesign — the Admin Management UI's "Delete" action
     // reuses this same suspend mechanism (see class doc comment on
     // AdminsTab/AdminManagement); block an admin from suspending their OWN
@@ -286,6 +295,15 @@ export class AdminService {
       throw new BadRequestException('You cannot suspend your own account.')
     }
     const target = await this.prisma.user.findUniqueOrThrow({ where: { id: targetUserId } })
+    // Role Separation — this route is only gated by users.write, a
+    // grantable ADMIN permission, so unlike updateUserRole below it has no
+    // @Roles('SUPER_ADMIN') at the controller to fall back on. Re-check here:
+    // a plain ADMIN must never be able to suspend/reactivate a SUPER_ADMIN
+    // account, no matter which permissions it holds. A SUPER_ADMIN acting on
+    // another SUPER_ADMIN is unaffected.
+    if (target.role === 'SUPER_ADMIN' && actorRole !== 'SUPER_ADMIN') {
+      throw new ForbiddenException('Only a Super Admin can change another Super Admin\'s status.')
+    }
     const updated = await this.prisma.user.update({ where: { id: targetUserId }, data: { status: dto.status } })
 
     await this.recordAdminAction(adminId, dto.status === 'SUSPENDED' ? AuditEvent.USER_SUSPENDED : dto.status === 'ACTIVE' ? AuditEvent.USER_REACTIVATED : AuditEvent.USER_STATUS_CHANGED, targetUserId, dto.reason, { status: target.status }, { status: dto.status })
@@ -520,11 +538,15 @@ export class AdminService {
 
   // ---- Admin management (permissions) --------------------------------------
 
-  // ADMIN/SUPER_ADMIN accounts only — "creating/deleting administrators"
-  // (role promotion/demotion) happens via updateUserRole above.
+  // ADMIN accounts only — deliberately unconditional, for EVERY viewer
+  // including a SUPER_ADMIN one. This is the "Administrator Accounts" list
+  // (Admin Management); a SUPER_ADMIN account must never appear in it, full
+  // stop — not even to another SUPER_ADMIN. Role promotion/demotion still
+  // happens via updateUserRole above, and a second Super Admin is still
+  // created via createSuperAdmin below; this list just never displays one.
   async listAdmins() {
     const admins = await this.prisma.user.findMany({
-      where: { role: { in: ['ADMIN', 'SUPER_ADMIN'] } },
+      where: { role: 'ADMIN' },
       orderBy: { createdAt: 'asc' },
       include: { userPermissions: { include: { permission: true } } },
     })
@@ -564,6 +586,19 @@ export class AdminService {
 
     await this.recordAdminAction(adminId, AuditEvent.USER_CREATED, user.id, dto.reason, undefined, { email: user.email, role: 'ADMIN' })
     return toPublicUser(user)
+  }
+
+  // "Create Super Admin" — a SUPER_ADMIN-only UI action for standing up a
+  // second, fully independent Super Admin account without hand-driving the
+  // role-change API. Deliberately just composes the two existing,
+  // independently step-up-gated and independently audited actions above
+  // (create a brand-new ADMIN, then promote that exact account to
+  // SUPER_ADMIN) rather than reimplementing any validation, hashing, or
+  // audit logic — USER_CREATED then ROLE_CHANGED are recorded exactly as
+  // they would be for the equivalent two-step flow through the panel.
+  async createSuperAdmin(dto: CreateAdminDto, adminId: string) {
+    const created = await this.createAdmin(dto, adminId)
+    return this.updateUserRole(created.id, { role: 'SUPER_ADMIN', reason: dto.reason, confirmPassword: dto.confirmPassword }, adminId)
   }
 
   // Admin-set password reset for ANOTHER admin (not self-service password

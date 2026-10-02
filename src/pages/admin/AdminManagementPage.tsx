@@ -47,6 +47,7 @@ export function AdminManagementPage() {
   const [expanded, setExpanded] = useState<string | null>(null)
   const [pending, setPending] = useState<{ admin: AdminRow; permission: string; grant: boolean } | null>(null)
   const [creating, setCreating] = useState(false)
+  const [creatingSuperAdmin, setCreatingSuperAdmin] = useState(false)
   const [resetting, setResetting] = useState<AdminRow | null>(null)
   const [suspending, setSuspending] = useState<AdminRow | null>(null)
   const [suspendBusy, setSuspendBusy] = useState(false)
@@ -67,7 +68,19 @@ export function AdminManagementPage() {
         title="Administrator Accounts"
         description="Manage administrator accounts, passwords, and permissions."
         back={{ to: '/admin' }}
-        actions={<button onClick={() => setCreating(true)} className="admin-btn-success">+ Add Admin</button>}
+        actions={
+          <div className="flex gap-2">
+            <button onClick={() => setCreating(true)} className="admin-btn-success">+ Add Admin</button>
+            {/* Server-side enforced (POST /admin/admins/super-admin is
+                @Roles('SUPER_ADMIN') only) — this client-side check is a
+                UX nicety only, so a plain ADMIN who reached this page via a
+                granted admins.read permission never sees a control that
+                would just 403 for them. */}
+            {viewer?.role === 'SUPER_ADMIN' && (
+              <button onClick={() => setCreatingSuperAdmin(true)} className="admin-btn-primary">+ Create Super Admin</button>
+            )}
+          </div>
+        }
       />
 
       <AdminPanel loading={loading} error={error} refetch={refetch}>
@@ -165,6 +178,10 @@ export function AdminManagementPage() {
         <AddAdminModal onClose={() => setCreating(false)} onCreated={() => { setCreating(false); refetch() }} />
       )}
 
+      {creatingSuperAdmin && (
+        <CreateSuperAdminModal onClose={() => setCreatingSuperAdmin(false)} onCreated={() => { setCreatingSuperAdmin(false); refetch() }} />
+      )}
+
       {resetting && (
         <ResetPasswordModal admin={resetting} onClose={() => setResetting(null)} onDone={() => setResetting(null)} />
       )}
@@ -195,6 +212,37 @@ function AddAdminModal({ onClose, onCreated }: { onClose: () => void; onCreated:
         if (!email.trim() || password.length < 12) throw new ApiError(0, 'Enter a valid email and a password of at least 12 characters.', null)
         const res = await tryAction(() => api.post('/admin/admins', { email: email.trim(), fullName: fullName.trim() || undefined, password, reason, confirmPassword }))
         if (res.ok) { push('success', 'Administrator created.'); onCreated() }
+        else throw new ApiError(0, res.error, null)
+      }}
+      onClose={onClose}
+    >
+      <div><label className="admin-label">Email</label><input className="admin-input" type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></div>
+      <div><label className="admin-label">Full name (optional)</label><input className="admin-input" value={fullName} onChange={(e) => setFullName(e.target.value)} /></div>
+      <div><label className="admin-label">Initial password (min. 12 characters)</label><input className="admin-input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></div>
+    </StepUpModal>
+  )
+}
+
+// Creates a brand-new account AND promotes it to SUPER_ADMIN in one step —
+// backed by POST /admin/admins/super-admin, which itself just composes the
+// existing createAdmin + role-change actions server-side (see
+// AdminService.createSuperAdmin). Same StepUpModal pattern as every other
+// sensitive action on this page — the server, not this confirmation UI, is
+// what actually enforces SUPER_ADMIN-only + re-authenticated access.
+function CreateSuperAdminModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+  const { push } = useToast()
+  const [email, setEmail] = useState('')
+  const [fullName, setFullName] = useState('')
+  const [password, setPassword] = useState('')
+
+  return (
+    <StepUpModal
+      title="Create a second Super Admin"
+      description="You are about to grant SUPER_ADMIN privileges to a new account. This gives the account platform-owner-level administrative access, equal to your own. Requires step-up re-authentication."
+      onConfirm={async ({ reason, confirmPassword }) => {
+        if (!email.trim() || password.length < 12) throw new ApiError(0, 'Enter a valid email and a password of at least 12 characters.', null)
+        const res = await tryAction(() => api.post('/admin/admins/super-admin', { email: email.trim(), fullName: fullName.trim() || undefined, password, reason, confirmPassword }))
+        if (res.ok) { push('success', 'Second Super Admin created.'); onCreated() }
         else throw new ApiError(0, res.error, null)
       }}
       onClose={onClose}

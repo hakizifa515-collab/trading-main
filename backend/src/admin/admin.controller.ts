@@ -122,7 +122,7 @@ export class AdminController {
   @Patch('users/:id/status')
   @RequirePermissions('users.write')
   updateUserStatus(@Param('id') id: string, @Body() dto: UpdateUserStatusDto, @CurrentUser() admin: AuthenticatedUser) {
-    return this.adminService.updateUserStatus(id, dto, admin.id)
+    return this.adminService.updateUserStatus(id, dto, admin.id, admin.role)
   }
 
   // Phase 6F Checkpoint F, Part 14/15 — distinct from user status above;
@@ -275,6 +275,16 @@ export class AdminController {
   @Roles('SUPER_ADMIN')
   createAdmin(@Body() dto: CreateAdminDto, @CurrentUser() admin: AuthenticatedUser) {
     return this.adminService.createAdmin(dto, admin.id)
+  }
+
+  // "Create Super Admin" — SUPER_ADMIN only, no @RequirePermissions escape
+  // hatch, same as updateUserRole below: standing up another platform-owner-
+  // level account is a role-tier action, never a grantable permission. See
+  // AdminService.createSuperAdmin for what this actually composes.
+  @Post('admins/super-admin')
+  @Roles('SUPER_ADMIN')
+  createSuperAdmin(@Body() dto: CreateAdminDto, @CurrentUser() admin: AuthenticatedUser) {
+    return this.adminService.createSuperAdmin(dto, admin.id)
   }
 
   @Patch('admins/:id/reset-password')
