@@ -68,14 +68,24 @@ export const PERMISSIONS = [
   'support.tickets.resolve',
   'support.tickets.close',
   'support.categories.manage',
+  // Editing a message you previously sent (SupportService.editStaffMessage,
+  // via AdminSupportController.editMessage) — a normal, grantable ADMIN
+  // permission like every other key here. SUPER_ADMIN always has it via
+  // PermissionsGuard's/assertPermission's role bypass; a plain ADMIN has it
+  // ONLY once explicitly granted — there is no automatic grant from any
+  // other support.* permission, and granting every other permission in this
+  // list still does not include this one by itself. The author-only rule
+  // (you may only edit your own message) and message DELETION remain
+  // completely separate and unaffected: deletion is still SUPER_ADMIN only,
+  // by role, with no permission able to reach it — see
+  // AdminSupportController.deleteMessage()'s @Roles('SUPER_ADMIN').
+  'support.messages.edit',
   // Cross-ticket moderation feed (every ticket's full message history,
   // PUBLIC and INTERNAL, plus the message-edit trail) — deliberately a
   // SEPARATE permission from support.tickets.read, which only ever exposes
   // one ticket at a time to staff already working it. Like every permission
   // here, a plain ADMIN has this only if a SUPER_ADMIN explicitly grants it;
-  // SUPER_ADMIN always has it via PermissionsGuard's role bypass. Message
-  // EDITING itself is not permission-gated at all — see
-  // AdminSupportController.editMessage()'s @Roles('SUPER_ADMIN').
+  // SUPER_ADMIN always has it via PermissionsGuard's role bypass.
   'support.audit',
 ] as const
 

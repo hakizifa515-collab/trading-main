@@ -260,7 +260,7 @@ export class SupportService {
 
     await this.audit.record({ actorId: adminId, action: AuditEvent.TICKET_STARTED_BY_STAFF, targetType: 'SUPPORT_TICKET', targetId: ticket.id, metadata: { userId: dto.userId } })
     await this.notify(dto.userId, ticket.id, 'AGENT_REPLIED', 'Support sent you a message.')
-    return this.getTicketForStaff(ticket.id)
+    return this.getTicketForStaff(ticket.id, adminId)
   }
 
   listAllTickets(status?: string) {
@@ -329,18 +329,27 @@ export class SupportService {
   // "clean normal view" treatment as PUBLIC-only filtering for a customer;
   // a deleted message is reviewable ONLY through listSupportAuditFeed()
   // above, never through the ordinary staff ticket view.
-  async getTicketForStaff(ticketId: string) {
-    const ticket = await this.prisma.supportTicket.findUnique({
-      where: { id: ticketId },
-      include: {
-        category: true,
-        user: { select: { id: true, email: true, fullName: true, kycStatus: true } },
-        assignedAgent: { select: { id: true, email: true, fullName: true } },
-        messages: { where: { deletedAt: null }, orderBy: { createdAt: 'asc' }, include: { author: { select: { id: true, email: true, fullName: true, role: true } }, attachments: true } },
-      },
-    })
+  //
+  // `viewerId` is used only to compute `viewerCanEditMessages`, a UX-only
+  // convenience flag telling the frontend whether to offer the edit gesture
+  // at all — the PATCH route's own @RequirePermissions('support.messages.edit')
+  // and editStaffMessage()'s own assertPermission() re-check remain the
+  // actual, authoritative enforcement regardless of what this flag says.
+  async getTicketForStaff(ticketId: string, viewerId: string) {
+    const [ticket, viewerCanEditMessages] = await Promise.all([
+      this.prisma.supportTicket.findUnique({
+        where: { id: ticketId },
+        include: {
+          category: true,
+          user: { select: { id: true, email: true, fullName: true, kycStatus: true } },
+          assignedAgent: { select: { id: true, email: true, fullName: true } },
+          messages: { where: { deletedAt: null }, orderBy: { createdAt: 'asc' }, include: { author: { select: { id: true, email: true, fullName: true, role: true } }, attachments: true } },
+        },
+      }),
+      this.hasPermission(viewerId, 'support.messages.edit'),
+    ])
     if (!ticket) throw new NotFoundException('Ticket not found.')
-    return ticket
+    return { ...ticket, viewerCanEditMessages }
   }
 
   // A staff reply defaults to PUBLIC (visible to the customer); INTERNAL
@@ -388,17 +397,19 @@ export class SupportService {
   // No customer notification and no admin email: an edit is a correction to
   // an existing message, not new activity on the ticket.
   //
-  // SUPER_ADMIN ONLY. This is checked again here, not just by
-  // AdminSupportController.editMessage()'s @Roles('SUPER_ADMIN') — the same
-  // defense-in-depth posture as every other fund/accountability-critical
-  // check in this codebase (e.g. isDemoResultModeAllowed() in the options
-  // settlement path). No support.* permission grants this to a plain ADMIN;
-  // it is not a permission at all, it is a role. On top of that the caller
-  // must still be the message's own author — a SUPER_ADMIN cannot edit
-  // another admin's or a customer's message either.
+  // SUPER_ADMIN always; a plain ADMIN only with the explicit
+  // support.messages.edit grant. Checked again here via assertPermission(),
+  // not just by AdminSupportController.editMessage()'s
+  // @RequirePermissions('support.messages.edit') — the same defense-in-depth
+  // posture as every other fund/accountability-critical check in this
+  // codebase (e.g. isDemoResultModeAllowed() in the options settlement
+  // path). Granting every OTHER support.* (or any other) permission does
+  // not include this one — it must be granted explicitly, same as any
+  // permission. On top of that the caller must still be the message's own
+  // author — a SUPER_ADMIN or a permitted ADMIN still cannot edit another
+  // admin's or a customer's message.
   async editStaffMessage(adminId: string, ticketId: string, messageId: string, dto: EditMessageDto) {
-    const admin = await this.prisma.user.findUniqueOrThrow({ where: { id: adminId } })
-    if (admin.role !== 'SUPER_ADMIN') throw new ForbiddenException('Only a Super Admin can edit a support message.')
+    await this.assertPermission(adminId, 'support.messages.edit')
 
     const message = await this.prisma.supportMessage.findUnique({ where: { id: messageId } })
     if (!message || message.ticketId !== ticketId || message.deletedAt) throw new NotFoundException('Message not found.')
@@ -723,14 +734,22 @@ export class SupportService {
   }
 
   // Mirrors PermissionsGuard's own check (SUPER_ADMIN bypasses; ADMIN needs
-  // an explicit grant) for the cases above where the required permission
-  // depends on a value in the request body (target status, message
-  // visibility) rather than being fixed at route-definition time, so the
-  // declarative @RequirePermissions() decorator alone can't express it.
-  private async assertPermission(userId: string, permission: PermissionKey) {
+  // an explicit grant). Used both where the required permission depends on
+  // a value in the request body (target status, message visibility) rather
+  // than being fixed at route-definition time — so the declarative
+  // @RequirePermissions() decorator alone can't express it — and as a
+  // defense-in-depth re-check inside a service method whose route already
+  // has the matching @RequirePermissions() (editStaffMessage below).
+  private async hasPermission(userId: string, permission: PermissionKey): Promise<boolean> {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } })
-    if (user.role === 'SUPER_ADMIN') return
+    if (user.role === 'SUPER_ADMIN') return true
     const granted = await this.prisma.userPermission.findFirst({ where: { userId, permission: { key: permission } } })
-    if (!granted) throw new ForbiddenException(`Missing required permission(s): ${permission}`)
+    return !!granted
+  }
+
+  private async assertPermission(userId: string, permission: PermissionKey) {
+    if (!(await this.hasPermission(userId, permission))) {
+      throw new ForbiddenException(`Missing required permission(s): ${permission}`)
+    }
   }
 }

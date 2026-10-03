@@ -368,17 +368,21 @@ function MessageContextMenu({ at, onEdit, onClose }: { at: { x: number; y: numbe
   )
 }
 
-// One message in the staff thread. Editing is SUPER_ADMIN ONLY — a plain
-// ADMIN never gets the gesture, no matter which support.* permissions it
-// holds (Role Separation). Among Super Admin's own messages, only the ones
-// it sent itself get the edit gesture (right-click on desktop, press-and-hold
-// on touch) and an inline editor; everyone else's are inert. Nothing here
-// ever renders an "edited" marker, a timestamp change or the previous text —
-// after saving, the bubble simply shows the new wording. The backend is what
-// actually decides who may edit (SUPER_ADMIN role + author-only —
-// AdminSupportController.editMessage()'s @Roles('SUPER_ADMIN') rejects a
-// plain ADMIN before this handler's code ever runs, even via a direct API
-// call); this only decides who is OFFERED it.
+// One message in the staff thread. Editing requires SUPER_ADMIN or the
+// support.messages.edit permission (Role Separation) — a plain ADMIN
+// without that specific grant never gets the gesture, no matter which
+// OTHER support.* permissions it holds. `canEdit` (passed in by the caller)
+// also requires the message to be one the viewer sent themselves — only
+// those get the edit gesture (right-click on desktop, press-and-hold on
+// touch) and an inline editor; everyone else's are inert. Nothing here ever
+// renders an "edited" marker, a timestamp change or the previous text —
+// after saving, the bubble simply shows the new wording. The backend is
+// what actually decides who may edit (AdminSupportController.editMessage()'s
+// @RequirePermissions('support.messages.edit'), re-checked again inside
+// SupportService.editStaffMessage() via assertPermission(), rejects an
+// ungranted ADMIN even via a direct API call); this only decides who is
+// OFFERED it, using `viewerCanEditMessages` from the ticket fetch as the
+// UX-only signal for whether the signed-in viewer currently holds it.
 function MessageBubble({
   message, ticketId, customerName, isCustomer, canEdit, displayBody, onEdited,
 }: {
@@ -605,7 +609,7 @@ function SupportTicketDetail({ ticket, onBack, onChanged, onMessageEdited }: { t
                   ticketId={ticket.id}
                   customerName={customerName}
                   isCustomer={isCustomer}
-                  canEdit={!!currentUser && currentUser.role === 'SUPER_ADMIN' && m.authorId === currentUser.id}
+                  canEdit={!!currentUser && (currentUser.role === 'SUPER_ADMIN' || !!data.viewerCanEditMessages) && m.authorId === currentUser.id}
                   displayBody={bodyOf(m)}
                   onEdited={(id, from, to) => {
                     setEdits((prev) => ({ ...prev, [id]: { from, to } }))

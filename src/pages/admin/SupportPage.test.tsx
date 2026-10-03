@@ -436,7 +436,7 @@ describe('Admin SupportPage', () => {
   // The backend enforcement itself (rejecting a direct API call regardless
   // of what the UI shows) is covered in backend/test/support.e2e-spec.ts's
   // "30f2".
-  describe('message editing is SUPER_ADMIN only — a plain ADMIN gets neither gesture, even on its own message', () => {
+  describe('message editing requires support.messages.edit (or SUPER_ADMIN) — a plain ADMIN without it gets neither gesture, even on its own message', () => {
     afterEach(() => { vi.useRealTimers() })
 
     it('desktop: right-clicking a message this ADMIN itself sent opens no menu', async () => {
@@ -458,6 +458,54 @@ describe('Admin SupportPage', () => {
     it('the bubble carries no data-editable marker for a plain ADMIN\'s own message', async () => {
       await openThread()
       expect(bubbleOf('Your withdrawal is being processed.')).not.toHaveAttribute('data-editable')
+    })
+  })
+
+  // Role Separation extension — support.messages.edit is a grantable ADMIN
+  // permission now; the ticket fetch's viewerCanEditMessages flag (set by
+  // the backend per-viewer, see support.service.ts's getTicketForStaff) is
+  // the UX-only signal this page reads to decide whether to offer the same
+  // gesture a SUPER_ADMIN always gets. The real enforcement is server-side
+  // (backend/test/support.e2e-spec.ts's "30l"/"30m"/"30f2") — this only
+  // proves the frontend reacts correctly to that flag.
+  describe('message editing via a granted permission — a plain ADMIN with support.messages.edit gets the same gesture as SUPER_ADMIN, on its own message only', () => {
+    beforeEach(() => {
+      currentUser = { id: 'admin1', role: 'ADMIN' }
+      apiGet.mockImplementation((path: string) => {
+        if (path === '/admin/support/tickets') return Promise.resolve([TICKET])
+        if (path === '/admin/support/tickets/t1') return Promise.resolve({ ...TICKET, viewerCanEditMessages: true })
+        if (path === '/admin/support/agents') return Promise.resolve([])
+        return Promise.resolve(null)
+      })
+    })
+    afterEach(() => { vi.useRealTimers() })
+
+    it('desktop: right-clicking a message this ADMIN itself sent opens a menu with "Edit message"', async () => {
+      await openThread()
+      fireEvent.contextMenu(bubbleOf('Your withdrawal is being processed.'))
+      const menu = screen.getByRole('menu')
+      expect(within(menu).getByRole('menuitem', { name: 'Edit message' })).toBeInTheDocument()
+    })
+
+    it('choosing Edit pre-fills the current text; Save replaces the message in place and PATCHes only that message', async () => {
+      apiPatch.mockResolvedValue({ id: 'm3', body: 'Approved via granted permission.' })
+      await openThread()
+      fireEvent.contextMenu(bubbleOf('Your withdrawal is being processed.'))
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Edit message' }))
+      const editor = screen.getByRole('textbox', { name: 'Edit message' }) as HTMLTextAreaElement
+      expect(editor.value).toBe('Your withdrawal is being processed.')
+
+      fireEvent.change(editor, { target: { value: 'Approved via granted permission.' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+      await waitFor(() => expect(apiPatch).toHaveBeenCalledWith('/admin/support/tickets/t1/messages/m3', { body: 'Approved via granted permission.' }))
+      expect(await screen.findByText('Approved via granted permission.')).toBeInTheDocument()
+    })
+
+    it('still does not offer editing for another staff member\'s message, even with the permission granted', async () => {
+      await openThread()
+      fireEvent.contextMenu(bubbleOf('Other agent reply.'))
+      expect(screen.queryByRole('menu')).not.toBeInTheDocument()
     })
   })
 

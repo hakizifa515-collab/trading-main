@@ -56,8 +56,8 @@ export class AdminSupportController {
 
   @Get('tickets/:id')
   @RequirePermissions('support.tickets.read')
-  getTicket(@Param('id') id: string) {
-    return this.support.getTicketForStaff(id)
+  getTicket(@Param('id') id: string, @CurrentUser() admin: AuthenticatedUser) {
+    return this.support.getTicketForStaff(id, admin.id)
   }
 
   // Deliberately NO @RequirePermissions() here — the actual required
@@ -74,28 +74,32 @@ export class AdminSupportController {
     return this.support.addStaffMessage(admin.id, id, dto)
   }
 
-  // Editing a message you previously sent — SUPER_ADMIN ONLY. @Roles here
-  // overrides the class-level @Roles('ADMIN', 'SUPER_ADMIN') entirely (Nest's
-  // getAllAndOverride takes the handler's own metadata, not a union with the
-  // class's), so a plain ADMIN is rejected by RolesGuard before this handler
-  // ever runs — not merely a hidden button. No @RequirePermissions(): this is
-  // deliberately not a grantable permission, it is a role. The author-only
-  // rule (you may only edit your own message) is enforced in
-  // SupportService.editStaffMessage(), which independently re-checks the
-  // SUPER_ADMIN role too (defense in depth). There is deliberately no
-  // customer-facing counterpart on SupportController.
+  // Editing a message you previously sent — SUPER_ADMIN always; a plain
+  // ADMIN only once explicitly granted support.messages.edit. No handler-
+  // level @Roles() override here (unlike deleteMessage below), so the
+  // class-level @Roles('ADMIN', 'SUPER_ADMIN') applies and PermissionsGuard
+  // does the real work: it rejects a plain ADMIN without the grant, and
+  // SUPER_ADMIN bypasses it entirely (same mechanism as every other
+  // @RequirePermissions route). The author-only rule (you may only edit
+  // your own message) is enforced in SupportService.editStaffMessage(),
+  // which independently re-checks the permission too via assertPermission()
+  // (defense in depth — see that method's own comment). There is
+  // deliberately no customer-facing counterpart on SupportController.
   @Patch('tickets/:ticketId/messages/:messageId')
-  @Roles('SUPER_ADMIN')
+  @RequirePermissions('support.messages.edit')
   editMessage(@Param('ticketId') ticketId: string, @Param('messageId') messageId: string, @Body() dto: EditMessageDto, @CurrentUser() admin: AuthenticatedUser) {
     return this.support.editStaffMessage(admin.id, ticketId, messageId, dto)
   }
 
-  // Deleting (soft) a message — SUPER_ADMIN ONLY, same @Roles override
-  // pattern as editMessage() immediately above, so a plain ADMIN is rejected
-  // by RolesGuard before this handler ever runs, direct API call included.
-  // No @RequirePermissions(): deletion is a role, not a grantable
-  // permission — holding support.audit (which only gates VIEWING the
-  // moderation feed) does not grant this. There is deliberately no
+  // Deleting (soft) a message — SUPER_ADMIN ONLY. Unlike editMessage()
+  // immediately above (now a grantable permission), deletion keeps the
+  // @Roles('SUPER_ADMIN') override: it is a role, not a grantable
+  // permission — holding support.messages.edit or support.audit (which
+  // only gates VIEWING the moderation feed) does not grant this. @Roles
+  // here overrides the class-level @Roles('ADMIN', 'SUPER_ADMIN') entirely
+  // (Nest's getAllAndOverride takes the handler's own metadata, not a union
+  // with the class's), so a plain ADMIN is rejected by RolesGuard before
+  // this handler ever runs, direct API call included. There is deliberately no
   // customer-facing counterpart, and no "restore" endpoint (this is scoped
   // exactly to the requested capability — a real undo would need its own
   // separate, explicit design).

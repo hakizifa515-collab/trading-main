@@ -368,6 +368,11 @@ export interface SupportTicket {
   user?: { id: ID; email: string; fullName: string; kycStatus?: KycStatus }
   assignedAgent?: { id: ID; email: string; fullName: string } | null
   messages?: SupportMessage[]
+  // UX-only hint for whether the currently signed-in staff viewer holds
+  // SUPER_ADMIN or the support.messages.edit permission — the backend's own
+  // PATCH route authorization is what's actually authoritative. Present
+  // only on the admin staff-detail response (getTicketForStaff).
+  viewerCanEditMessages?: boolean
 }
 
 // ---------------------------------------------------------------------------

@@ -30,11 +30,13 @@ const PERMISSIONS = [
   // Support (Role Separation) — support.tickets.reply/internal_note already
   // existed and were previously ungrantable through this page (only
   // reachable via a raw API call); listed here now so a Super Admin can
-  // actually delegate day-to-day Support work through the UI. Message
-  // EDITING is deliberately NOT here — it is a role (SUPER_ADMIN only), not
-  // a grantable permission; see AdminSupportController.editMessage().
+  // actually delegate day-to-day Support work through the UI.
   'support.tickets.read', 'support.tickets.assign', 'support.tickets.update', 'support.tickets.reply',
   'support.tickets.internal_note', 'support.tickets.resolve', 'support.tickets.close', 'support.categories.manage',
+  // Editing a message you sent — a normal grantable permission (message
+  // DELETION remains SUPER_ADMIN only by role, with no permission able to
+  // reach it; see AdminSupportController.deleteMessage()).
+  'support.messages.edit',
   // Cross-ticket moderation feed — SUPER_ADMIN has it for free; ungranted by
   // default for a plain ADMIN, same as every permission above.
   'support.audit',

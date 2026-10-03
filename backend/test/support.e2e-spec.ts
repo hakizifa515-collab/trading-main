@@ -711,10 +711,11 @@ describe('Customer Support (real PostgreSQL)', () => {
     expect(await prisma.auditLog.count({ where: { action: 'SUPPORT_MESSAGE_EDITED', targetId: { in: [messageId, customerMsg.id] } } })).toBe(0)
   })
 
-  it('30f2. a plain ADMIN can NEVER edit a support message via the API — not another author\'s, and not even one it sent itself — no matter which support.* permissions it holds; only the role matters', async () => {
-    // The ADMIN authors its own message (with full support permissions, the
-    // same way any ordinary staff reply is created) and then tries to edit
-    // that exact message it just sent.
+  it('30f2. an ADMIN without the support.messages.edit permission gets 403 — not another author\'s, and not even one it sent itself — regardless of which OTHER support.* permissions it holds', async () => {
+    // The ADMIN authors its own message (with every OTHER support
+    // permission, deliberately excluding support.messages.edit, the same
+    // way any ordinary staff reply is created) and then tries to edit that
+    // exact message it just sent.
     const customer = await makeCustomer('edit-plainadmin')
     const ticket = await request(server).post('/support/tickets').set('Cookie', customer.cookie).send({ categoryId, subject: 'Q', message: 'hi' }).expect(201)
     const fullAgent = await makeAgentWith('support.tickets.read', 'support.tickets.reply', 'support.tickets.internal_note', 'support.tickets.update', 'support.tickets.assign', 'support.tickets.resolve', 'support.tickets.close', 'support.audit')
@@ -800,6 +801,63 @@ describe('Customer Support (real PostgreSQL)', () => {
 
     await request(server).patch(editUrl(ticket.body.id, note.body.id)).set('Cookie', agent.cookie).send({ body: 'sneaky' }).expect(403)
     expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: note.body.id } })).body).toBe('Escalate to finance')
+  })
+
+  // ---- support.messages.edit — a plain ADMIN can now be granted editing ---
+
+  it('30l. an ADMIN explicitly granted support.messages.edit can edit a message it sent — same as a Super Admin, still author-only, still audited', async () => {
+    const customer = await makeCustomer('edit-grantedadmin')
+    const ticket = await request(server).post('/support/tickets').set('Cookie', customer.cookie).send({ categoryId, subject: 'Q', message: 'hi' }).expect(201)
+    const agent = await makeAgentWith('support.tickets.read', 'support.tickets.reply', 'support.messages.edit')
+    const own = await request(server).post(`/admin/support/tickets/${ticket.body.id}/messages`).set('Cookie', agent.cookie).send({ body: 'original reply' }).expect(201)
+
+    await request(server).patch(editUrl(ticket.body.id, own.body.id)).set('Cookie', agent.cookie).send({ body: 'corrected reply' }).expect(200)
+    expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: own.body.id } })).body).toBe('corrected reply')
+    expect(await prisma.auditLog.count({ where: { action: 'SUPPORT_MESSAGE_EDITED', targetId: own.body.id } })).toBe(1)
+
+    // Still author-only: this same ADMIN cannot edit a Super Admin's message
+    // just because it holds the permission.
+    const { ticketId, messageId, originalBody } = await ticketWithAgentMessage()
+    await request(server).patch(editUrl(ticketId, messageId)).set('Cookie', agent.cookie).send({ body: 'not mine' }).expect(403)
+    expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: messageId } })).body).toBe(originalBody)
+  })
+
+  it('30m. an ADMIN holding every one of the 55 defined permissions (including support.messages.edit) can edit its own message, but is still refused every genuinely SUPER_ADMIN-only Support action — holding every permission is not the same as being SUPER_ADMIN', async () => {
+    const { PERMISSIONS } = await import('../src/common/permissions')
+    const customer = await makeCustomer('edit-fullpermadmin')
+    const ticket = await request(server).post('/support/tickets').set('Cookie', customer.cookie).send({ categoryId, subject: 'Q', message: 'hi' }).expect(201)
+    const agent = await makeAgentWith(...PERMISSIONS)
+    const own = await request(server).post(`/admin/support/tickets/${ticket.body.id}/messages`).set('Cookie', agent.cookie).send({ body: 'full-permission reply' }).expect(201)
+
+    // Can edit — support.messages.edit is one of the 55.
+    await request(server).patch(editUrl(ticket.body.id, own.body.id)).set('Cookie', agent.cookie).send({ body: 'edited by full-permission admin' }).expect(200)
+    expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: own.body.id } })).body).toBe('edited by full-permission admin')
+
+    // Still cannot delete its own (or anyone else's) message — deletion stays SUPER_ADMIN-only by role, not by permission.
+    const delRes = await del(agent.cookie, ticket.body.id, own.body.id)
+    expect(delRes.status).toBe(403)
+    expect((await prisma.supportMessage.findUniqueOrThrow({ where: { id: own.body.id } })).deletedAt).toBeNull()
+
+    // And every other @Roles('SUPER_ADMIN')-only action remains blocked too.
+    await request(server).post('/admin/admins/super-admin').set('Cookie', agent.cookie)
+      .send({ email: uniqueEmail('shouldnotexist'), password: 'a-strong-password-12', reason: 'x', confirmPassword: 'correct-horse-battery' }).expect(403)
+    await request(server).patch(`/admin/users/${customer.userId}/role`).set('Cookie', agent.cookie)
+      .send({ role: 'SUPER_ADMIN', reason: 'x', confirmPassword: 'correct-horse-battery' }).expect(403)
+  })
+
+  it('30n. GET /admin/support/tickets/:id reports viewerCanEditMessages correctly for a Super Admin, a permitted ADMIN, and an unpermitted ADMIN — a UX hint only, computed fresh per viewer', async () => {
+    const { ticketId, agent: superAgent } = await ticketWithAgentMessage()
+
+    const superRes = await request(server).get(`/admin/support/tickets/${ticketId}`).set('Cookie', superAgent.cookie).expect(200)
+    expect(superRes.body.viewerCanEditMessages).toBe(true)
+
+    const permittedAgent = await makeAgentWith('support.tickets.read', 'support.messages.edit')
+    const permittedRes = await request(server).get(`/admin/support/tickets/${ticketId}`).set('Cookie', permittedAgent.cookie).expect(200)
+    expect(permittedRes.body.viewerCanEditMessages).toBe(true)
+
+    const unpermittedAgent = await makeAgentWith('support.tickets.read', 'support.tickets.reply', 'support.audit')
+    const unpermittedRes = await request(server).get(`/admin/support/tickets/${ticketId}`).set('Cookie', unpermittedAgent.cookie).expect(200)
+    expect(unpermittedRes.body.viewerCanEditMessages).toBe(false)
   })
 
   // ---- Support Audit (SUPER_ADMIN by default; grantable to an ADMIN) -----
