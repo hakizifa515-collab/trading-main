@@ -386,17 +386,21 @@ describe('Authorization: roles + fine-grained permissions (real PostgreSQL)', ()
         .expect(400)
     })
 
-    // Administrator Accounts (GET /admin/admins) must never show a
-    // SUPER_ADMIN row to ANY viewer — a plain ADMIN holding admins.read, AND
-    // a SUPER_ADMIN viewer themselves. This is a deliberate, unconditional
-    // exclusion: unlike listUsers()'s SUPER_ADMIN-hiding, there is no
-    // "but a Super Admin viewer still sees them" carve-out here.
-    it('GET /admin/admins never returns a SUPER_ADMIN row, for a plain ADMIN (even with admins.read) OR for a SUPER_ADMIN viewer — ADMIN rows still appear for both', async () => {
+    // Administrator Accounts (GET /admin/admins): a SUPER_ADMIN viewer sees
+    // their OWN row plus every ADMIN row, but never any OTHER Super Admin's
+    // row. A plain ADMIN viewer (even holding admins.read) sees ADMIN rows
+    // only — no Super Admin row at all, including not their own (not
+    // applicable to an ADMIN, but covered by the same unconditional branch).
+    it('a SUPER_ADMIN viewer sees their own row + every ADMIN row, but not another Super Admin\'s row; a plain ADMIN viewer sees ADMIN rows only', async () => {
       const superEmail = uniqueEmail('listadminssuper')
       const superPassword = 'correct-horse-battery'
       const { user: grantor } = await createUserDirect(prisma, { email: superEmail, password: superPassword, role: 'SUPER_ADMIN' })
       const grantorSecret = await enableTotpDirect(prisma, grantor.id)
       const grantorCookie = await loginCookie(server, superEmail, superPassword, grantorSecret)
+
+      const otherSuperEmail = uniqueEmail('listadminsothersuper')
+      const otherSuperPassword = 'correct-horse-battery'
+      const { user: otherSuper } = await createUserDirect(prisma, { email: otherSuperEmail, password: otherSuperPassword, role: 'SUPER_ADMIN' })
 
       const plainAdminEmail = uniqueEmail('listadminsplain')
       const plainAdminPassword = 'correct-horse-battery'
@@ -405,18 +409,43 @@ describe('Authorization: roles + fine-grained permissions (real PostgreSQL)', ()
         .send({ reason: 'test grant', confirmPassword: superPassword }).expect(200)
       const plainAdminCookie = await loginCookie(server, plainAdminEmail, plainAdminPassword)
 
-      // 1. SUPER_ADMIN viewer → ADMIN rows returned, SUPER_ADMIN rows excluded
-      //    (not even the viewer's own SUPER_ADMIN row).
+      // A. / B. / C. — SUPER_ADMIN viewer: own row (A) + ADMIN rows (B), never otherSuper (C).
       const asSuperAdmin = await request(server).get('/admin/admins').set('Cookie', grantorCookie).expect(200)
-      expect((asSuperAdmin.body as { role: string }[]).some((a) => a.role === 'SUPER_ADMIN')).toBe(false)
-      expect((asSuperAdmin.body as { id: string }[]).some((a) => a.id === grantor.id)).toBe(false)
-      expect((asSuperAdmin.body as { id: string }[]).some((a) => a.id === plainAdmin.id)).toBe(true)
+      const superIds = (asSuperAdmin.body as { id: string }[]).map((a) => a.id)
+      expect(superIds).toContain(grantor.id) // A
+      expect(superIds).toContain(plainAdmin.id) // B
+      expect(superIds).not.toContain(otherSuper.id) // C
 
-      // 2. ADMIN viewer (holding admins.read) → same: ADMIN rows only.
+      // D. / E. — ADMIN viewer (holding admins.read): ADMIN rows only, no Super Admin at all.
       const asPlainAdmin = await request(server).get('/admin/admins').set('Cookie', plainAdminCookie).expect(200)
-      expect((asPlainAdmin.body as { role: string }[]).some((a) => a.role === 'SUPER_ADMIN')).toBe(false)
+      expect((asPlainAdmin.body as { role: string }[]).every((a) => a.role === 'ADMIN')).toBe(true) // E
+      expect((asPlainAdmin.body as { id: string }[]).some((a) => a.id === plainAdmin.id)).toBe(true) // D
       expect((asPlainAdmin.body as { id: string }[]).some((a) => a.id === grantor.id)).toBe(false)
-      expect((asPlainAdmin.body as { id: string }[]).some((a) => a.id === plainAdmin.id)).toBe(true)
+      expect((asPlainAdmin.body as { id: string }[]).some((a) => a.id === otherSuper.id)).toBe(false)
+    })
+
+    // Section 4's "Access another SUPER_ADMIN's sensitive account
+    // information" — GET /admin/users/:id (getUserDetail) is gated only by
+    // the grantable users.read permission, so a plain ADMIN could otherwise
+    // reach a Super Admin's balances/deposits/withdrawals directly by id,
+    // even though listUsers() already keeps that id out of the list they'd
+    // browse to find it. A SUPER_ADMIN viewer is unaffected.
+    it('a plain ADMIN gets 403 on GET /admin/users/:id for a SUPER_ADMIN target, even holding users.read; a SUPER_ADMIN viewer can view it', async () => {
+      const superEmail = uniqueEmail('userdetailsuper')
+      const superPassword = 'correct-horse-battery'
+      const { user: targetSuper } = await createUserDirect(prisma, { email: superEmail, password: superPassword, role: 'SUPER_ADMIN' })
+      const superSecret = await enableTotpDirect(prisma, targetSuper.id)
+      const superCookie = await loginCookie(server, superEmail, superPassword, superSecret)
+
+      const plainAdminEmail = uniqueEmail('userdetailplain')
+      const plainAdminPassword = 'correct-horse-battery'
+      const { user: plainAdmin } = await createUserDirect(prisma, { email: plainAdminEmail, password: plainAdminPassword, role: 'ADMIN' })
+      await request(server).patch(`/admin/admins/${plainAdmin.id}/permissions/users.read/grant`).set('Cookie', superCookie)
+        .send({ reason: 'test grant', confirmPassword: superPassword }).expect(200)
+      const plainAdminCookie = await loginCookie(server, plainAdminEmail, plainAdminPassword)
+
+      await request(server).get(`/admin/users/${targetSuper.id}`).set('Cookie', plainAdminCookie).expect(403)
+      await request(server).get(`/admin/users/${targetSuper.id}`).set('Cookie', superCookie).expect(200)
     })
 
     // Direct-API confirmation that an ADMIN cannot retrieve a SUPER_ADMIN

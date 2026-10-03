@@ -269,8 +269,17 @@ export class AdminService {
   // history is deliberately NOT folded in here (keeps this response bounded
   // and reuses the dedicated Trade Management list/filter instead of
   // duplicating it) — Admin Panel redesign.
-  async getUserDetail(userId: string) {
+  async getUserDetail(userId: string, viewerRole: Role) {
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id: userId } })
+    // Role Separation — this route is only gated by users.read, a grantable
+    // ADMIN permission, so a plain ADMIN could otherwise reach a SUPER_ADMIN
+    // account's full detail (balances, deposits, withdrawals) by calling
+    // this directly with a known/guessed id, even though listUsers() above
+    // already keeps SUPER_ADMIN rows out of the list a normal ADMIN would
+    // browse to find one. A SUPER_ADMIN viewer is unaffected.
+    if (user.role === 'SUPER_ADMIN' && viewerRole !== 'SUPER_ADMIN') {
+      throw new ForbiddenException('Only a Super Admin can view another Super Admin\'s account detail.')
+    }
     const account = await this.prisma.account.findFirst({ where: { userId } })
     const balances = account ? await this.accounts.listNonZeroAssetBalances(userId) : []
     const [deposits, withdrawals] = await Promise.all([
@@ -538,15 +547,17 @@ export class AdminService {
 
   // ---- Admin management (permissions) --------------------------------------
 
-  // ADMIN accounts only — deliberately unconditional, for EVERY viewer
-  // including a SUPER_ADMIN one. This is the "Administrator Accounts" list
-  // (Admin Management); a SUPER_ADMIN account must never appear in it, full
-  // stop — not even to another SUPER_ADMIN. Role promotion/demotion still
-  // happens via updateUserRole above, and a second Super Admin is still
-  // created via createSuperAdmin below; this list just never displays one.
-  async listAdmins() {
+  // "Administrator Accounts" list. Every OTHER Super Admin is always
+  // excluded, for every viewer — but a SUPER_ADMIN viewer's OWN row is
+  // included (so they can see their own account listed, same as any other
+  // administrator), while a plain ADMIN viewer never sees any SUPER_ADMIN
+  // row at all, including their own (not applicable — an ADMIN can't be
+  // viewing as SUPER_ADMIN). Role promotion/demotion still happens via
+  // updateUserRole above, and a second Super Admin is still created via
+  // createSuperAdmin below; this list just controls what's displayed.
+  async listAdmins(viewerId: string, viewerRole: Role) {
     const admins = await this.prisma.user.findMany({
-      where: { role: 'ADMIN' },
+      where: viewerRole === 'SUPER_ADMIN' ? { OR: [{ role: 'ADMIN' }, { id: viewerId }] } : { role: 'ADMIN' },
       orderBy: { createdAt: 'asc' },
       include: { userPermissions: { include: { permission: true } } },
     })
@@ -638,7 +649,7 @@ export class AdminService {
     })
 
     await this.recordAdminAction(superAdminId, AuditEvent.PERMISSION_CHANGED, targetAdminId, dto.reason, { granted: false }, { granted: true, permission: permissionKey })
-    return this.listAdmins()
+    return this.listAdmins(superAdminId, 'SUPER_ADMIN') // this route is @Roles('SUPER_ADMIN')-only — the caller is always a Super Admin
   }
 
   async revokePermission(targetAdminId: string, permissionKey: PermissionKey, superAdminId: string, dto: { reason: string; confirmPassword: string }) {
@@ -648,7 +659,7 @@ export class AdminService {
     await this.prisma.userPermission.deleteMany({ where: { userId: targetAdminId, permissionId: permission.id } })
 
     await this.recordAdminAction(superAdminId, AuditEvent.PERMISSION_CHANGED, targetAdminId, dto.reason, { granted: true, permission: permissionKey }, { granted: false })
-    return this.listAdmins()
+    return this.listAdmins(superAdminId, 'SUPER_ADMIN') // this route is @Roles('SUPER_ADMIN')-only — the caller is always a Super Admin
   }
 
   // Withdrawal approval requires step-up too (explicitly listed as

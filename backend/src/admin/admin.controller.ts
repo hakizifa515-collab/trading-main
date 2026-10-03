@@ -115,8 +115,8 @@ export class AdminController {
 
   @Get('users/:id')
   @RequirePermissions('users.read')
-  getUserDetail(@Param('id') id: string) {
-    return this.adminService.getUserDetail(id)
+  getUserDetail(@Param('id') id: string, @CurrentUser() admin: AuthenticatedUser) {
+    return this.adminService.getUserDetail(id, admin.role)
   }
 
   @Patch('users/:id/status')
@@ -265,8 +265,8 @@ export class AdminController {
 
   @Get('admins')
   @RequirePermissions('admins.read')
-  listAdmins() {
-    return this.adminService.listAdmins()
+  listAdmins(@CurrentUser() admin: AuthenticatedUser) {
+    return this.adminService.listAdmins(admin.id, admin.role)
   }
 
   // SUPER_ADMIN only + step-up — creating a new administrator account is the
