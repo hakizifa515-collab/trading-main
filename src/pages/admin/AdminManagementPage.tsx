@@ -48,6 +48,7 @@ export function AdminManagementPage() {
   const [pending, setPending] = useState<{ admin: AdminRow; permission: string; grant: boolean } | null>(null)
   const [creating, setCreating] = useState(false)
   const [creatingSuperAdmin, setCreatingSuperAdmin] = useState(false)
+  const [grantingAll, setGrantingAll] = useState(false)
   const [resetting, setResetting] = useState<AdminRow | null>(null)
   const [suspending, setSuspending] = useState<AdminRow | null>(null)
   const [suspendBusy, setSuspendBusy] = useState(false)
@@ -78,6 +79,13 @@ export function AdminManagementPage() {
                 would just 403 for them. */}
             {viewer?.role === 'SUPER_ADMIN' && (
               <button onClick={() => setCreatingSuperAdmin(true)} className="admin-btn-primary">+ Create Super Admin</button>
+            )}
+            {/* Server-side enforced (PATCH /admin/admins/permissions/grant-all
+                is @Roles('SUPER_ADMIN') only). Administrator Accounts below
+                only ever shows the signed-in viewer's own row now, so this
+                targets an account by email instead of by clicking a row. */}
+            {viewer?.role === 'SUPER_ADMIN' && (
+              <button onClick={() => setGrantingAll(true)} className="admin-btn-info">Grant All ADMIN Permissions</button>
             )}
           </div>
         }
@@ -182,6 +190,10 @@ export function AdminManagementPage() {
         <CreateSuperAdminModal onClose={() => setCreatingSuperAdmin(false)} onCreated={() => { setCreatingSuperAdmin(false); refetch() }} />
       )}
 
+      {grantingAll && (
+        <GrantAllPermissionsModal onClose={() => setGrantingAll(false)} onDone={() => setGrantingAll(false)} />
+      )}
+
       {resetting && (
         <ResetPasswordModal admin={resetting} onClose={() => setResetting(null)} onDone={() => setResetting(null)} />
       )}
@@ -250,6 +262,33 @@ function CreateSuperAdminModal({ onClose, onCreated }: { onClose: () => void; on
       <div><label className="admin-label">Email</label><input className="admin-input" type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></div>
       <div><label className="admin-label">Full name (optional)</label><input className="admin-input" value={fullName} onChange={(e) => setFullName(e.target.value)} /></div>
       <div><label className="admin-label">Initial password (min. 12 characters)</label><input className="admin-input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></div>
+    </StepUpModal>
+  )
+}
+
+// Bulk-grants every currently-defined permission to one existing ADMIN
+// account in a single step-up-confirmed call — backed by
+// PATCH /admin/admins/permissions/grant-all (AdminService.grantAllAdminPermissions),
+// which itself just loops over the same single-permission grant the
+// per-row expandable panel above already used. Targets by email since
+// Administrator Accounts no longer lists any account but the viewer's own.
+function GrantAllPermissionsModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
+  const { push } = useToast()
+  const [email, setEmail] = useState('')
+
+  return (
+    <StepUpModal
+      title="Grant All ADMIN Permissions"
+      description="Grants every currently-defined permission to an existing ADMIN account (never SUPER_ADMIN, and never changes its role). Requires step-up re-authentication."
+      onConfirm={async ({ reason, confirmPassword }) => {
+        if (!email.trim()) throw new ApiError(0, 'Enter the target administrator\'s email.', null)
+        const res = await tryAction(() => api.patch('/admin/admins/permissions/grant-all', { email: email.trim(), reason, confirmPassword }))
+        if (res.ok) { push('success', 'All permissions granted.'); onDone() }
+        else throw new ApiError(0, res.error, null)
+      }}
+      onClose={onClose}
+    >
+      <div><label className="admin-label">Administrator's email (must already be role ADMIN)</label><input className="admin-input" type="email" value={email} onChange={(e) => setEmail(e.target.value)} /></div>
     </StepUpModal>
   )
 }

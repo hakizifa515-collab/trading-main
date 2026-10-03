@@ -16,6 +16,7 @@ import { OrderReconciliationService } from '../orders/order-reconciliation.servi
 import { OPEN_ORDER_STATUSES } from '../orders/order-risk-math'
 import { RISK_REASON_CODES } from '../orders/risk-engine.types'
 import { toPublicUser } from '../users/public-user'
+import { PERMISSIONS } from '../common/permissions'
 import type { PermissionKey } from '../common/permissions'
 import type { FinancialAdjustmentDto } from './dto/financial-adjustment.dto'
 import type { UpdateUserStatusDto } from './dto/update-user-status.dto'
@@ -26,6 +27,7 @@ import type { UpdateMarketConfigDto } from './dto/update-market-config.dto'
 import type { GrantPermissionDto } from './dto/grant-permission.dto'
 import type { CreateAdminDto } from './dto/create-admin.dto'
 import type { ResetAdminPasswordDto } from './dto/reset-admin-password.dto'
+import type { GrantAllAdminPermissionsDto } from './dto/grant-all-admin-permissions.dto'
 
 @Injectable()
 export class AdminService {
@@ -547,17 +549,18 @@ export class AdminService {
 
   // ---- Admin management (permissions) --------------------------------------
 
-  // "Administrator Accounts" list. Every OTHER Super Admin is always
-  // excluded, for every viewer — but a SUPER_ADMIN viewer's OWN row is
-  // included (so they can see their own account listed, same as any other
-  // administrator), while a plain ADMIN viewer never sees any SUPER_ADMIN
-  // row at all, including their own (not applicable — an ADMIN can't be
-  // viewing as SUPER_ADMIN). Role promotion/demotion still happens via
-  // updateUserRole above, and a second Super Admin is still created via
-  // createSuperAdmin below; this list just controls what's displayed.
-  async listAdmins(viewerId: string, viewerRole: Role) {
+  // "Administrator Accounts" list — deliberately scoped to the AUTHENTICATED
+  // caller's own account only, for every role, including SUPER_ADMIN. No
+  // other administrator's identity, role, permissions, or existence is ever
+  // revealed through this endpoint, to anyone. `viewerId` comes from the
+  // session-validated AuthenticatedUser (see AdminController.listAdmins),
+  // never from a client-supplied id — there is no parameter here a caller
+  // could manipulate to see someone else's row. Still returns an array (of
+  // exactly one element) to keep the response shape — and the existing
+  // frontend table, which simply maps over it — unchanged.
+  async listAdmins(viewerId: string) {
     const admins = await this.prisma.user.findMany({
-      where: viewerRole === 'SUPER_ADMIN' ? { OR: [{ role: 'ADMIN' }, { id: viewerId }] } : { role: 'ADMIN' },
+      where: { id: viewerId },
       orderBy: { createdAt: 'asc' },
       include: { userPermissions: { include: { permission: true } } },
     })
@@ -565,6 +568,20 @@ export class AdminService {
       ...toPublicUser(a),
       permissions: a.userPermissions.map((p) => p.permission.key),
     }))
+  }
+
+  // Shared by grantPermission/revokePermission/grantAllAdminPermissions
+  // below — their own target's updated public info + permission list, now
+  // that listAdmins() above is scoped to the CALLER's own account and can no
+  // longer double as "the refreshed row for whichever admin I just edited."
+  // (The existing frontend doesn't actually read this response — it calls
+  // refetch() instead — but a real, correct value belongs here regardless.)
+  private async getAdminPublicInfo(userId: string) {
+    const user = await this.prisma.user.findUniqueOrThrow({
+      where: { id: userId },
+      include: { userPermissions: { include: { permission: true } } },
+    })
+    return { ...toPublicUser(user), permissions: user.userPermissions.map((p) => p.permission.key) }
   }
 
   // Creates a brand-new ADMIN account directly (never SUPER_ADMIN — reaching
@@ -649,7 +666,7 @@ export class AdminService {
     })
 
     await this.recordAdminAction(superAdminId, AuditEvent.PERMISSION_CHANGED, targetAdminId, dto.reason, { granted: false }, { granted: true, permission: permissionKey })
-    return this.listAdmins(superAdminId, 'SUPER_ADMIN') // this route is @Roles('SUPER_ADMIN')-only — the caller is always a Super Admin
+    return this.getAdminPublicInfo(targetAdminId)
   }
 
   async revokePermission(targetAdminId: string, permissionKey: PermissionKey, superAdminId: string, dto: { reason: string; confirmPassword: string }) {
@@ -659,7 +676,45 @@ export class AdminService {
     await this.prisma.userPermission.deleteMany({ where: { userId: targetAdminId, permissionId: permission.id } })
 
     await this.recordAdminAction(superAdminId, AuditEvent.PERMISSION_CHANGED, targetAdminId, dto.reason, { granted: true, permission: permissionKey }, { granted: false })
-    return this.listAdmins(superAdminId, 'SUPER_ADMIN') // this route is @Roles('SUPER_ADMIN')-only — the caller is always a Super Admin
+    return this.getAdminPublicInfo(targetAdminId)
+  }
+
+  // "Grant All ADMIN Permissions" — a SUPER_ADMIN-only bulk convenience that
+  // grants every currently-defined PERMISSIONS key to one existing ADMIN
+  // account in a single step-up-confirmed action, instead of the 55
+  // individual grant calls (and 55 step-up prompts) the panel would
+  // otherwise require. This is not a second permission system — it's a loop
+  // over the exact same UserPermission upsert + PERMISSION_CHANGED audit
+  // shape grantPermission() above already uses. A permission the target
+  // already holds is left untouched and produces no audit row (no fake
+  // duplicate grant) — only genuinely new ones are recorded. Can only ever
+  // target an existing ADMIN: never a USER (not an administrator at all)
+  // and never a SUPER_ADMIN (role is completely untouched by this, and
+  // SUPER_ADMIN bypasses the permission system entirely anyway — granting
+  // these to one would be a no-op at best, confusing at worst).
+  async grantAllAdminPermissions(dto: GrantAllAdminPermissionsDto, superAdminId: string) {
+    await this.stepUp.assertStepUpAuthorized(superAdminId, dto.confirmPassword)
+
+    const target = await this.prisma.user.findUnique({ where: { email: dto.email.toLowerCase() } })
+    if (!target) throw new BadRequestException('No account exists with that email.')
+    if (target.role !== 'ADMIN') throw new BadRequestException('This action only applies to an existing ADMIN account.')
+
+    const permissions = await this.prisma.permission.findMany({ where: { key: { in: [...PERMISSIONS] } } })
+    const existing = await this.prisma.userPermission.findMany({ where: { userId: target.id }, select: { permissionId: true } })
+    const existingIds = new Set(existing.map((p) => p.permissionId))
+    const toGrant = permissions.filter((p) => !existingIds.has(p.id))
+
+    for (const p of toGrant) {
+      await this.prisma.userPermission.create({ data: { userId: target.id, permissionId: p.id } })
+      await this.recordAdminAction(superAdminId, AuditEvent.PERMISSION_CHANGED, target.id, dto.reason, { granted: false }, { granted: true, permission: p.key })
+    }
+
+    return {
+      ...(await this.getAdminPublicInfo(target.id)),
+      grantedNow: toGrant.map((p) => p.key),
+      alreadyHeld: permissions.length - toGrant.length,
+      total: permissions.length,
+    }
   }
 
   // Withdrawal approval requires step-up too (explicitly listed as

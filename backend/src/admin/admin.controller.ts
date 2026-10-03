@@ -19,6 +19,7 @@ import { UpdateUserRoleDto } from './dto/update-user-role.dto'
 import { UpdatePlatformSettingsDto } from './dto/update-platform-settings.dto'
 import { UpdateMarketConfigDto } from './dto/update-market-config.dto'
 import { GrantPermissionDto } from './dto/grant-permission.dto'
+import { GrantAllAdminPermissionsDto } from './dto/grant-all-admin-permissions.dto'
 import { ApproveWithdrawalDto } from './dto/approve-withdrawal.dto'
 import { CreateAdminDto } from './dto/create-admin.dto'
 import { ResetAdminPasswordDto } from './dto/reset-admin-password.dto'
@@ -266,7 +267,7 @@ export class AdminController {
   @Get('admins')
   @RequirePermissions('admins.read')
   listAdmins(@CurrentUser() admin: AuthenticatedUser) {
-    return this.adminService.listAdmins(admin.id, admin.role)
+    return this.adminService.listAdmins(admin.id)
   }
 
   // SUPER_ADMIN only + step-up — creating a new administrator account is the
@@ -305,5 +306,16 @@ export class AdminController {
   @Roles('SUPER_ADMIN')
   revokePermission(@Param('id') id: string, @Param('permission') permission: string, @Body() dto: RevokePermissionDto, @CurrentUser() admin: AuthenticatedUser) {
     return this.adminService.revokePermission(id, permission as PermissionKey, admin.id, dto)
+  }
+
+  // "Grant All ADMIN Permissions" — SUPER_ADMIN only, no @RequirePermissions
+  // escape hatch, same tier as every other admin-management action above.
+  // Target is identified by email in the body, not a URL id — Administrator
+  // Accounts (GET /admin/admins) no longer lists other administrators to
+  // click into, so this is invoked from its own small form instead.
+  @Patch('admins/permissions/grant-all')
+  @Roles('SUPER_ADMIN')
+  grantAllAdminPermissions(@Body() dto: GrantAllAdminPermissionsDto, @CurrentUser() admin: AuthenticatedUser) {
+    return this.adminService.grantAllAdminPermissions(dto, admin.id)
   }
 }

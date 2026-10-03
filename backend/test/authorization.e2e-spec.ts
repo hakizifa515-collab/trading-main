@@ -386,12 +386,13 @@ describe('Authorization: roles + fine-grained permissions (real PostgreSQL)', ()
         .expect(400)
     })
 
-    // Administrator Accounts (GET /admin/admins): a SUPER_ADMIN viewer sees
-    // their OWN row plus every ADMIN row, but never any OTHER Super Admin's
-    // row. A plain ADMIN viewer (even holding admins.read) sees ADMIN rows
-    // only — no Super Admin row at all, including not their own (not
-    // applicable to an ADMIN, but covered by the same unconditional branch).
-    it('a SUPER_ADMIN viewer sees their own row + every ADMIN row, but not another Super Admin\'s row; a plain ADMIN viewer sees ADMIN rows only', async () => {
+    // Administrator Accounts (GET /admin/admins) — scoped to the
+    // AUTHENTICATED caller's own account only, for every role. Not "every
+    // administrator sees administrators of their own tier" — literally
+    // exactly one row, always the caller's own, never another SUPER_ADMIN,
+    // never another ADMIN, regardless of permissions held or how many
+    // other administrators exist.
+    it('a SUPER_ADMIN viewer sees ONLY their own row; a plain ADMIN viewer (even holding admins.read) sees ONLY their own row — never another administrator, of either role', async () => {
       const superEmail = uniqueEmail('listadminssuper')
       const superPassword = 'correct-horse-battery'
       const { user: grantor } = await createUserDirect(prisma, { email: superEmail, password: superPassword, role: 'SUPER_ADMIN' })
@@ -409,19 +410,24 @@ describe('Authorization: roles + fine-grained permissions (real PostgreSQL)', ()
         .send({ reason: 'test grant', confirmPassword: superPassword }).expect(200)
       const plainAdminCookie = await loginCookie(server, plainAdminEmail, plainAdminPassword)
 
-      // A. / B. / C. — SUPER_ADMIN viewer: own row (A) + ADMIN rows (B), never otherSuper (C).
-      const asSuperAdmin = await request(server).get('/admin/admins').set('Cookie', grantorCookie).expect(200)
-      const superIds = (asSuperAdmin.body as { id: string }[]).map((a) => a.id)
-      expect(superIds).toContain(grantor.id) // A
-      expect(superIds).toContain(plainAdmin.id) // B
-      expect(superIds).not.toContain(otherSuper.id) // C
+      const otherAdminEmail = uniqueEmail('listadminsotherplain')
+      const otherAdminPassword = 'correct-horse-battery'
+      const { user: otherAdmin } = await createUserDirect(prisma, { email: otherAdminEmail, password: otherAdminPassword, role: 'ADMIN' })
 
-      // D. / E. — ADMIN viewer (holding admins.read): ADMIN rows only, no Super Admin at all.
+      // SUPER_ADMIN viewer → exactly one row, their own.
+      const asSuperAdmin = await request(server).get('/admin/admins').set('Cookie', grantorCookie).expect(200)
+      expect(asSuperAdmin.body).toHaveLength(1)
+      expect((asSuperAdmin.body as { id: string }[])[0].id).toBe(grantor.id)
+
+      // Plain ADMIN viewer (holding admins.read) → exactly one row, their own —
+      // never otherSuper, never otherAdmin, never grantor.
       const asPlainAdmin = await request(server).get('/admin/admins').set('Cookie', plainAdminCookie).expect(200)
-      expect((asPlainAdmin.body as { role: string }[]).every((a) => a.role === 'ADMIN')).toBe(true) // E
-      expect((asPlainAdmin.body as { id: string }[]).some((a) => a.id === plainAdmin.id)).toBe(true) // D
-      expect((asPlainAdmin.body as { id: string }[]).some((a) => a.id === grantor.id)).toBe(false)
-      expect((asPlainAdmin.body as { id: string }[]).some((a) => a.id === otherSuper.id)).toBe(false)
+      expect(asPlainAdmin.body).toHaveLength(1)
+      expect((asPlainAdmin.body as { id: string }[])[0].id).toBe(plainAdmin.id)
+      const planIds = (asPlainAdmin.body as { id: string }[]).map((a) => a.id)
+      expect(planIds).not.toContain(otherSuper.id)
+      expect(planIds).not.toContain(otherAdmin.id)
+      expect(planIds).not.toContain(grantor.id)
     })
 
     // Section 4's "Access another SUPER_ADMIN's sensitive account
@@ -448,11 +454,11 @@ describe('Authorization: roles + fine-grained permissions (real PostgreSQL)', ()
       await request(server).get(`/admin/users/${targetSuper.id}`).set('Cookie', superCookie).expect(200)
     })
 
-    // Direct-API confirmation that an ADMIN cannot retrieve a SUPER_ADMIN
-    // account through this endpoint by any means available to it (no query
-    // param, filter, or permission combination exposes one — the service
-    // query itself never includes role SUPER_ADMIN, regardless of caller).
-    it('an ADMIN cannot retrieve any SUPER_ADMIN account through GET /admin/admins by any direct API means', async () => {
+    // Direct-API confirmation that no permission combination lets an ADMIN
+    // retrieve ANY other administrator — Super Admin or otherwise — through
+    // this endpoint: the service query itself never includes anyone but the
+    // caller's own id, regardless of what's granted.
+    it('an ADMIN cannot retrieve any other administrator (Super Admin or ADMIN) through GET /admin/admins by any direct API means', async () => {
       const superEmail = uniqueEmail('listadminsnobypass')
       const superPassword = 'correct-horse-battery'
       const { user: superUser } = await createUserDirect(prisma, { email: superEmail, password: superPassword, role: 'SUPER_ADMIN' })
@@ -469,9 +475,8 @@ describe('Authorization: roles + fine-grained permissions (real PostgreSQL)', ()
       const plainAdminCookie = await loginCookie(server, plainAdminEmail, plainAdminPassword)
 
       const res = await request(server).get('/admin/admins').set('Cookie', plainAdminCookie).expect(200)
-      const ids = (res.body as { id: string }[]).map((a) => a.id)
-      expect(ids).not.toContain(superUser.id)
-      expect((res.body as { role: string }[]).every((a) => a.role === 'ADMIN')).toBe(true)
+      expect(res.body).toHaveLength(1)
+      expect((res.body as { id: string }[])[0].id).toBe(plainAdmin.id)
     })
 
     it('a plain ADMIN cannot promote OR demote a different, already-existing SUPER_ADMIN through the generic role-change API', async () => {
@@ -574,5 +579,209 @@ describe('Authorization: roles + fine-grained permissions (real PostgreSQL)', ()
     expect(typeof res.body.totalCustomerAssets).toBe('object')
     expect(Number(res.body.totalCustomerAssets.USD)).toBeGreaterThanOrEqual(100)
     expect(Number(res.body.totalCustomerAssets.USDT)).toBeGreaterThanOrEqual(50)
+  })
+
+  // "Grant the complete normal ADMIN permission set" — verifies, against the
+  // real permission system (no new code, no bulk endpoint), that granting
+  // every single key in PERMISSIONS to one ADMIN account (a) unlocks the
+  // full normal operational surface, (b) never unlocks anything
+  // SUPER_ADMIN-only — because those actions are @Roles('SUPER_ADMIN')
+  // route guards with no permission key at all, not something any amount of
+  // granting can reach — and (c) leaves the existing SUPER_ADMIN and the
+  // Administrator Accounts visibility rule untouched.
+  describe('granting the complete PERMISSIONS set to one ADMIN', () => {
+    it('unlocks every normal ADMIN-operational route while every SUPER_ADMIN-only route stays 403, the grant is fully audited, and the existing Super Admin is unaffected', async () => {
+      const { PERMISSIONS } = await import('../src/common/permissions')
+
+      const superEmail = uniqueEmail('fullsetsuper')
+      const superPassword = 'correct-horse-battery'
+      const { user: superUser } = await createUserDirect(prisma, { email: superEmail, password: superPassword, role: 'SUPER_ADMIN' })
+      const superSecret = await enableTotpDirect(prisma, superUser.id)
+      const superCookie = await loginCookie(server, superEmail, superPassword, superSecret)
+      const superSnapshotBefore = await prisma.user.findUniqueOrThrow({ where: { id: superUser.id } })
+
+      const targetEmail = uniqueEmail('fullsetadmin')
+      const targetPassword = 'correct-horse-battery'
+      const { user: target } = await createUserDirect(prisma, { email: targetEmail, password: targetPassword, role: 'ADMIN' })
+
+      // Grant every defined permission — one call per key, exactly the
+      // existing single-permission endpoint the real admin panel uses.
+      for (const key of PERMISSIONS) {
+        await request(server)
+          .patch(`/admin/admins/${target.id}/permissions/${key}/grant`)
+          .set('Cookie', superCookie)
+          .send({ reason: 'grant full normal ADMIN permission set', confirmPassword: superPassword })
+          .expect(200)
+      }
+
+      const targetCookie = await loginCookie(server, targetEmail, targetPassword)
+
+      // A representative ADMIN-operational route per permission domain now succeeds.
+      await request(server).get('/admin/overview').set('Cookie', targetCookie).expect(200) // platform.read
+      await request(server).get('/admin/users').set('Cookie', targetCookie).expect(200) // users.read
+      await request(server).get('/admin/deposits').set('Cookie', targetCookie).expect(200) // deposits.read
+      await request(server).get('/admin/withdrawals').set('Cookie', targetCookie).expect(200) // withdrawals.read
+      await request(server).get('/admin/kyc/submissions').set('Cookie', targetCookie).expect(200) // kyc.read
+      await request(server).get('/admin/audit-logs').set('Cookie', targetCookie).expect(200) // audit.read
+      await request(server).get('/admin/crypto-deposits/assets').set('Cookie', targetCookie).expect(200) // crypto_deposits.read
+      await request(server).get('/admin/contacts').set('Cookie', targetCookie).expect(200) // admin_contacts.read
+      await request(server).get('/admin/cms/pages').set('Cookie', targetCookie).expect(200) // cms.pages.read
+      await request(server).get('/admin/support/tickets').set('Cookie', targetCookie).expect(200) // support.tickets.read
+
+      // Every SUPER_ADMIN-only action stays 403 — role guards, not permissions,
+      // are what gate these, so no grant could ever reach them.
+      await request(server).post('/admin/admins/super-admin').set('Cookie', targetCookie)
+        .send({ email: uniqueEmail('shouldnotexist'), password: 'a-strong-password-12', reason: 'escalation attempt', confirmPassword: targetPassword })
+        .expect(403)
+      await request(server).patch(`/admin/users/${target.id}/role`).set('Cookie', targetCookie)
+        .send({ role: 'SUPER_ADMIN', reason: 'self-promote attempt', confirmPassword: targetPassword }).expect(403)
+      await request(server).patch(`/admin/admins/${superUser.id}/reset-password`).set('Cookie', targetCookie)
+        .send({ newPassword: 'a-strong-password-12', reason: 'attempt', confirmPassword: targetPassword }).expect(403)
+      await request(server).patch(`/admin/admins/${superUser.id}/permissions/users.read/revoke`).set('Cookie', targetCookie)
+        .send({ reason: 'attempt', confirmPassword: targetPassword }).expect(403)
+      await request(server).patch(`/admin/users/${superUser.id}/status`).set('Cookie', targetCookie)
+        .send({ status: 'SUSPENDED', reason: 'attempt' }).expect(403)
+      await request(server).get(`/admin/users/${superUser.id}`).set('Cookie', targetCookie).expect(403)
+
+      // The existing Super Admin account itself was never touched.
+      expect(await prisma.user.findUniqueOrThrow({ where: { id: superUser.id } })).toEqual(superSnapshotBefore)
+
+      // Fully audited: one PERMISSION_CHANGED AdminAction per granted key, actor = the granting Super Admin.
+      const logs = await prisma.adminAction.findMany({ where: { targetUserId: target.id, action: 'PERMISSION_CHANGED' } })
+      expect(logs.length).toBe(PERMISSIONS.length)
+      expect(logs.every((l) => l.adminId === superUser.id)).toBe(true)
+
+      // Still role ADMIN, never promoted by any of this.
+      expect((await prisma.user.findUniqueOrThrow({ where: { id: target.id } })).role).toBe('ADMIN')
+    })
+  })
+
+  // PATCH /admin/admins/permissions/grant-all — the "Grant All ADMIN
+  // Permissions" bulk convenience itself (as opposed to the test above,
+  // which proved the underlying per-key grant mechanism scales to the full
+  // set; this proves the new single endpoint built on top of it).
+  describe('PATCH /admin/admins/permissions/grant-all (bulk grant)', () => {
+    it('a SUPER_ADMIN can bulk-grant; the target gets exactly all 55 current PERMISSIONS, remains ADMIN, and every SUPER_ADMIN-only endpoint stays 403 for it', async () => {
+      const { PERMISSIONS } = await import('../src/common/permissions')
+
+      const superEmail = uniqueEmail('bulkgrantsuper')
+      const superPassword = 'correct-horse-battery'
+      const { user: superUser } = await createUserDirect(prisma, { email: superEmail, password: superPassword, role: 'SUPER_ADMIN' })
+      const superSecret = await enableTotpDirect(prisma, superUser.id)
+      const superCookie = await loginCookie(server, superEmail, superPassword, superSecret)
+
+      const targetEmail = uniqueEmail('bulkgranttarget')
+      const targetPassword = 'correct-horse-battery'
+      const { user: target } = await createUserDirect(prisma, { email: targetEmail, password: targetPassword, role: 'ADMIN' })
+
+      await request(server)
+        .patch('/admin/admins/permissions/grant-all')
+        .set('Cookie', superCookie)
+        .send({ email: targetEmail, reason: 'onboarding full admin access', confirmPassword: superPassword })
+        .expect(200)
+
+      const granted = await prisma.userPermission.findMany({ where: { userId: target.id }, include: { permission: true } })
+      expect(granted.map((g) => g.permission.key).sort()).toEqual([...PERMISSIONS].sort())
+      expect((await prisma.user.findUniqueOrThrow({ where: { id: target.id } })).role).toBe('ADMIN')
+
+      const targetCookie = await loginCookie(server, targetEmail, targetPassword)
+      await request(server).post('/admin/admins/super-admin').set('Cookie', targetCookie)
+        .send({ email: uniqueEmail('shouldnotexist'), password: 'a-strong-password-12', reason: 'test reason', confirmPassword: targetPassword }).expect(403)
+      await request(server).patch(`/admin/users/${target.id}/role`).set('Cookie', targetCookie)
+        .send({ role: 'SUPER_ADMIN', reason: 'test reason', confirmPassword: targetPassword }).expect(403)
+      await request(server).patch(`/admin/admins/${superUser.id}/reset-password`).set('Cookie', targetCookie)
+        .send({ newPassword: 'a-strong-password-12', reason: 'test reason', confirmPassword: targetPassword }).expect(403)
+      await request(server).patch(`/admin/admins/${superUser.id}/permissions/users.read/revoke`).set('Cookie', targetCookie)
+        .send({ reason: 'test reason', confirmPassword: targetPassword }).expect(403)
+      await request(server).patch(`/admin/users/${superUser.id}/status`).set('Cookie', targetCookie)
+        .send({ status: 'SUSPENDED', reason: 'test reason' }).expect(403)
+
+      // Fully audited: one PERMISSION_CHANGED row per key, correct actor/target/reason.
+      const logs = await prisma.adminAction.findMany({ where: { targetUserId: target.id, action: 'PERMISSION_CHANGED' } })
+      expect(logs.length).toBe(PERMISSIONS.length)
+      expect(logs.every((l) => l.adminId === superUser.id)).toBe(true)
+      expect(logs.every((l) => l.reason === 'onboarding full admin access')).toBe(true)
+      expect(logs.every((l) => l.createdAt instanceof Date)).toBe(true)
+      expect(JSON.stringify(logs)).not.toMatch(/correct-horse-battery/)
+    })
+
+    it('a plain ADMIN gets 403 attempting the bulk grant directly, even holding admins.read/admins.manage; a customer (USER) gets 403 too', async () => {
+      const superEmail = uniqueEmail('bulkgrantblocksuper')
+      const superPassword = 'correct-horse-battery'
+      const { user: superUser } = await createUserDirect(prisma, { email: superEmail, password: superPassword, role: 'SUPER_ADMIN' })
+      const superSecret = await enableTotpDirect(prisma, superUser.id)
+      const superCookie = await loginCookie(server, superEmail, superPassword, superSecret)
+
+      const actorEmail = uniqueEmail('bulkgrantactor')
+      const actorPassword = 'correct-horse-battery'
+      const { user: actor } = await createUserDirect(prisma, { email: actorEmail, password: actorPassword, role: 'ADMIN' })
+      for (const perm of ['admins.read', 'admins.manage']) {
+        await request(server).patch(`/admin/admins/${actor.id}/permissions/${perm}/grant`).set('Cookie', superCookie)
+          .send({ reason: 'test grant', confirmPassword: superPassword }).expect(200)
+      }
+      const actorCookie = await loginCookie(server, actorEmail, actorPassword)
+
+      const victimEmail = uniqueEmail('bulkgrantvictim')
+      const { user: victim } = await createUserDirect(prisma, { email: victimEmail, password: 'correct-horse-battery', role: 'ADMIN' })
+
+      await request(server).patch('/admin/admins/permissions/grant-all').set('Cookie', actorCookie)
+        .send({ email: victimEmail, reason: 'escalation attempt', confirmPassword: actorPassword }).expect(403)
+      expect(await prisma.userPermission.count({ where: { userId: victim.id } })).toBe(0)
+
+      const customerEmail = uniqueEmail('bulkgrantcustomer')
+      const customerPassword = 'correct-horse-battery'
+      await createUserDirect(prisma, { email: customerEmail, password: customerPassword, role: 'USER' })
+      const customerCookie = await loginCookie(server, customerEmail, customerPassword)
+      await request(server).patch('/admin/admins/permissions/grant-all').set('Cookie', customerCookie)
+        .send({ email: victimEmail, reason: 'escalation attempt', confirmPassword: customerPassword }).expect(403)
+
+      await request(server).patch('/admin/admins/permissions/grant-all')
+        .send({ email: victimEmail, reason: 'escalation attempt', confirmPassword: 'irrelevant' }).expect(401)
+    })
+
+    it('cannot target a SUPER_ADMIN or a plain USER, and does not create duplicate grants/audit rows for permissions the target already holds', async () => {
+      const superEmail = uniqueEmail('bulkgrantedge')
+      const superPassword = 'correct-horse-battery'
+      const { user: superUser } = await createUserDirect(prisma, { email: superEmail, password: superPassword, role: 'SUPER_ADMIN' })
+      const superSecret = await enableTotpDirect(prisma, superUser.id)
+      const superCookie = await loginCookie(server, superEmail, superPassword, superSecret)
+
+      // Target is SUPER_ADMIN — refused.
+      const otherSuperEmail = uniqueEmail('bulkgrantothersuper')
+      await createUserDirect(prisma, { email: otherSuperEmail, password: 'correct-horse-battery', role: 'SUPER_ADMIN' })
+      await request(server).patch('/admin/admins/permissions/grant-all').set('Cookie', superCookie)
+        .send({ email: otherSuperEmail, reason: 'test reason', confirmPassword: superPassword }).expect(400)
+
+      // Target is a plain USER — refused.
+      const customerEmail = uniqueEmail('bulkgrantcustomer2')
+      await createUserDirect(prisma, { email: customerEmail, password: 'correct-horse-battery', role: 'USER' })
+      await request(server).patch('/admin/admins/permissions/grant-all').set('Cookie', superCookie)
+        .send({ email: customerEmail, reason: 'test reason', confirmPassword: superPassword }).expect(400)
+
+      // Target doesn't exist — refused.
+      await request(server).patch('/admin/admins/permissions/grant-all').set('Cookie', superCookie)
+        .send({ email: uniqueEmail('doesnotexist'), reason: 'test reason', confirmPassword: superPassword }).expect(400)
+
+      // No duplicate: an ADMIN who already holds a couple of permissions gets
+      // the rest via bulk grant, with no new audit row for the ones it
+      // already had.
+      const targetEmail = uniqueEmail('bulkgrantpartial')
+      const { user: target } = await createUserDirect(prisma, { email: targetEmail, password: 'correct-horse-battery', role: 'ADMIN' })
+      await request(server).patch(`/admin/admins/${target.id}/permissions/users.read/grant`).set('Cookie', superCookie)
+        .send({ reason: 'pre-existing grant', confirmPassword: superPassword }).expect(200)
+
+      const { PERMISSIONS } = await import('../src/common/permissions')
+      await request(server).patch('/admin/admins/permissions/grant-all').set('Cookie', superCookie)
+        .send({ email: targetEmail, reason: 'bulk after partial', confirmPassword: superPassword }).expect(200)
+
+      const finalPerms = await prisma.userPermission.findMany({ where: { userId: target.id } })
+      expect(finalPerms.length).toBe(PERMISSIONS.length) // no duplicates — one row per key, not two for users.read
+
+      const usersReadLogs = await prisma.adminAction.findMany({
+        where: { targetUserId: target.id, action: 'PERMISSION_CHANGED' },
+      })
+      const usersReadGrantCount = usersReadLogs.filter((l) => (l.newState as { permission?: string } | null)?.permission === 'users.read').length
+      expect(usersReadGrantCount).toBe(1) // only the original pre-existing grant — bulk grant did not re-grant/re-audit it
+    })
   })
 })
